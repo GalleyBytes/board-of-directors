@@ -77,9 +77,10 @@ pub fn global_config_path() -> PathBuf {
     paths::app_dir().join(GLOBAL_CONFIG)
 }
 
-/// Load config: repo-scoped external config > legacy repo-local .bodrc.toml > global config > defaults
+/// Load config: repo-scoped external config > global config > defaults
 pub fn load(repo_root: &Path) -> Config {
-    if let Some(config) = try_load_repo_scoped(repo_root) {
+    let local_path = local_config_path(repo_root);
+    if let Some(config) = try_load(&local_path, &local_path.to_string_lossy()) {
         return config;
     }
 
@@ -129,33 +130,7 @@ pub fn write_global(config: &Config) -> Result<(), String> {
 
 pub fn write_local(config: &Config, repo_root: &Path) -> Result<(), String> {
     let path = local_config_path(repo_root);
-    write_config(config, &path)?;
-
-    let legacy_path = legacy_local_config_path(repo_root);
-    if legacy_path.exists() {
-        std::fs::remove_file(&legacy_path).map_err(|e| {
-            format!(
-                "Wrote repo-scoped config to {} but failed to remove legacy config {}: {}",
-                path.display(),
-                legacy_path.display(),
-                e
-            )
-        })?;
-    }
-
-    Ok(())
-}
-
-fn try_load_repo_scoped(repo_root: &Path) -> Option<Config> {
-    maybe_migrate_legacy_local_config(repo_root);
-
-    let local_path = local_config_path(repo_root);
-    if let Some(config) = try_load(&local_path, &local_path.to_string_lossy()) {
-        return Some(config);
-    }
-
-    let legacy_path = legacy_local_config_path(repo_root);
-    try_load(&legacy_path, &legacy_path.to_string_lossy())
+    write_config(config, &path)
 }
 
 fn write_config(config: &Config, path: &Path) -> Result<(), String> {
@@ -170,80 +145,14 @@ fn write_config(config: &Config, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn maybe_migrate_legacy_local_config(repo_root: &Path) {
-    let local_path = local_config_path(repo_root);
-    if local_path.exists() {
-        return;
-    }
-
-    let legacy_path = legacy_local_config_path(repo_root);
-    if !legacy_path.exists() {
-        return;
-    }
-
-    if let Some(parent) = local_path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        eprintln!(
-            "Warning: failed to create repo-scoped config directory {} while migrating {}: {}",
-            parent.display(),
-            legacy_path.display(),
-            e
-        );
-        return;
-    }
-
-    if let Err(e) = std::fs::copy(&legacy_path, &local_path) {
-        eprintln!(
-            "Warning: failed to migrate legacy repo config from {} to {}: {}",
-            legacy_path.display(),
-            local_path.display(),
-            e
-        );
-        return;
-    }
-
-    match std::fs::remove_file(&legacy_path) {
-        Ok(()) => {
-            println!(
-                "Migrated legacy repo config from {} to {}",
-                legacy_path.display(),
-                local_path.display()
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "Warning: migrated config to {} but failed to remove legacy file {}: {}",
-                local_path.display(),
-                legacy_path.display(),
-                e
-            );
-        }
-    }
-}
-
 pub fn global_config_exists() -> bool {
     global_config_path().exists()
 }
 
-pub fn existing_local_config_path(repo_root: &Path) -> Option<PathBuf> {
-    let local_path = local_config_path(repo_root);
-    if local_path.exists() {
-        return Some(local_path);
-    }
-
-    let legacy_path = legacy_local_config_path(repo_root);
-    if legacy_path.exists() {
-        return Some(legacy_path);
-    }
-
-    None
+pub fn local_config_exists(repo_root: &Path) -> bool {
+    local_config_path(repo_root).exists()
 }
 
 pub fn local_config_path(repo_root: &Path) -> PathBuf {
     paths::repo_config_path(repo_root)
-}
-
-pub fn legacy_local_config_path(repo_root: &Path) -> PathBuf {
-    paths::legacy_repo_config_path(repo_root)
 }

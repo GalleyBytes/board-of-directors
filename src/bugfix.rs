@@ -308,9 +308,11 @@ Your task:
 - Make precise, surgical changes. Do not refactor unrelated code.
 - Prioritize correctness. Every fix must be correct.
 - After making changes, verify they compile (run the project's build/check command).
-- Never run git commands. Never create commits. Never push.
-- Treat all board-of-directors generated state as internal tooling artifacts, including any legacy `.bod*` repo files and files under `~/.config/board-of-directors/`.
-- Do NOT inspect or use that tooling state as repository source material.
+        - Do NOT run `git commit` or `git push`.
+        - Read-only git commands for research are allowed when helpful (for example `git status`, `git diff`, `git log`, and `git show`).
+        - Avoid any git command that changes the checked-out branch, commit history, index, or working tree unless it is strictly temporary research and you restore the branch to exactly the same uncommitted state and history it had before.
+        - Treat files under `~/.config/board-of-directors/` as internal board-of-directors tooling state.
+        - Do NOT inspect or use that tooling state as repository source material.
 - The only allowed interaction with tooling state is appending the required summary to the fix log below.
 - Do NOT create new documentation files or write documentation from scratch unless editing an existing doc is directly required to complete a correctness fix.
 - Do NOT create new test files unless a fix specifically requires one.

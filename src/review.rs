@@ -149,9 +149,11 @@ Your task:
 - Prioritize correctness over complexity.
 - Keep your review concise enough for a human to read quickly. Do not be overly verbose.
 - Format your review as markdown.
-- Never run git commands. Never create commits. Never push.
-- Treat all board-of-directors generated state as internal tooling artifacts, including any legacy `.bod*` repo files and files under `~/.config/board-of-directors/`.
-- Do NOT inspect, reference, or use that tooling state as evidence about repository correctness.
+        - Do NOT run `git commit` or `git push`.
+        - Read-only git commands for research are allowed when helpful (for example `git status`, `git diff`, `git log`, and `git show`).
+        - Avoid any git command that changes the checked-out branch, commit history, index, or working tree unless it is strictly temporary research and you restore the branch to exactly the same uncommitted state and history it had before.
+        - Treat files under `~/.config/board-of-directors/` as internal board-of-directors tooling state.
+        - Do NOT inspect, reference, or use that tooling state as evidence about repository correctness.
 - Do NOT reference other reviewers or reviews.
 - The only allowed interaction with tooling state is writing the review file requested below.
 

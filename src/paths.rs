@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 const APP_DIR_NAME: &str = "board-of-directors";
 const REPO_CONFIG_FILE: &str = "config.toml";
-const LEGACY_REPO_STATE_DIR: &str = ".bod";
 
 pub fn app_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -32,14 +31,6 @@ pub fn ensure_repo_state_dir(repo_root: &Path) -> Result<PathBuf, String> {
 
 pub fn repo_config_path(repo_root: &Path) -> PathBuf {
     repo_state_dir(repo_root).join(REPO_CONFIG_FILE)
-}
-
-pub fn legacy_repo_config_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".bodrc.toml")
-}
-
-pub fn legacy_repo_state_dir(repo_root: &Path) -> PathBuf {
-    repo_root.join(LEGACY_REPO_STATE_DIR)
 }
 
 fn sanitize_component(value: &str) -> String {

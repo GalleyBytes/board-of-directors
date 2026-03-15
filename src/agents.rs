@@ -107,3 +107,63 @@ pub fn group_reviews_by_round(
 
     groups
 }
+
+pub fn latest_review_files(
+    files: &[String],
+    codenames: &[String],
+    sanitized_branch: &str,
+) -> Option<Vec<String>> {
+    let prefix = format!("{}-", sanitized_branch);
+
+    group_reviews_by_round(files, codenames)
+        .into_iter()
+        .filter_map(|(round_key, mut round_files)| {
+            let number = round_key.strip_prefix(&prefix)?.parse::<u32>().ok()?;
+            round_files.sort();
+            Some((number, round_files))
+        })
+        .max_by_key(|(number, _)| *number)
+        .map(|(_, round_files)| round_files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latest_review_files_picks_highest_round_for_branch() {
+        let files = vec![
+            "codex-feature-1.md".to_string(),
+            "gemini-feature-1.md".to_string(),
+            "opus-feature-1.md".to_string(),
+            "codex-feature-2.md".to_string(),
+            "gemini-feature-2.md".to_string(),
+            "opus-feature-2.md".to_string(),
+            "codex-other-3.md".to_string(),
+        ];
+        let codenames = vec![
+            "codex".to_string(),
+            "gemini".to_string(),
+            "opus".to_string(),
+        ];
+
+        let latest = latest_review_files(&files, &codenames, "feature").unwrap();
+
+        assert_eq!(
+            latest,
+            vec![
+                "codex-feature-2.md".to_string(),
+                "gemini-feature-2.md".to_string(),
+                "opus-feature-2.md".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn latest_review_files_returns_none_when_branch_has_no_reviews() {
+        let files = vec!["codex-other-1.md".to_string()];
+        let codenames = vec!["codex".to_string()];
+
+        assert!(latest_review_files(&files, &codenames, "feature").is_none());
+    }
+}

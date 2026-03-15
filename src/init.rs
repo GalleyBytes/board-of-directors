@@ -22,13 +22,9 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
     } else {
         let root =
             repo_root.ok_or("Not inside a git repository. Use --global for global config.")?;
-        let existing_path = config::existing_local_config_path(root);
         (
-            existing_path.is_some(),
-            existing_path
-                .unwrap_or_else(|| config::local_config_path(root))
-                .display()
-                .to_string(),
+            config::local_config_exists(root),
+            config::local_config_path(root).display().to_string(),
             {
                 let root = root.to_path_buf();
                 Box::new(move || try_load_local(&root).unwrap_or_default())
@@ -117,22 +113,18 @@ pub fn run(global: bool, reconfigure: bool, repo_root: Option<&Path>) -> Result<
 }
 
 fn try_load_local(repo_root: &Path) -> Option<Config> {
-    for path in [
-        config::local_config_path(repo_root),
-        config::legacy_local_config_path(repo_root),
-    ] {
-        if !path.exists() {
-            continue;
-        }
+    let path = config::local_config_path(repo_root);
+    if !path.exists() {
+        return None;
+    }
 
-        match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                if let Ok(config) = toml::from_str::<Config>(&content) {
-                    return Some(config);
-                }
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            if let Ok(config) = toml::from_str::<Config>(&content) {
+                return Some(config);
             }
-            Err(_) => continue,
         }
+        Err(_) => return None,
     }
 
     None

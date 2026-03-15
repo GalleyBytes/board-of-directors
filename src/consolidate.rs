@@ -77,6 +77,66 @@ pub async fn run(config: &Config) -> Result<(), String> {
 
     println!("\nConsolidating {} review file(s)...", selected_files.len());
 
+    write_selected_reviews(
+        &repo_root,
+        &state_dir,
+        &selected_files,
+        &config.consolidate.model,
+    )
+    .await
+}
+
+/// Non-interactive consolidation of the latest review run for the current branch.
+pub async fn run_latest(config: &Config) -> Result<(), String> {
+    let repo_root = git::repo_root()?;
+    let state_dir = files::ensure_state_dir(&repo_root)?;
+    let all_files = agents::list_review_files(&state_dir);
+    if all_files.is_empty() {
+        return Err(format!(
+            "No review files found in {}. Run 'bod review' first.",
+            state_dir.display()
+        ));
+    }
+
+    let branch = git::current_branch()?;
+    let sanitized = agents::sanitize_branch_name(&branch);
+    let codenames: Vec<String> = config
+        .review
+        .models
+        .iter()
+        .map(|m| m.codename.clone())
+        .collect();
+
+    let selected_files = agents::latest_review_files(&all_files, &codenames, &sanitized)
+        .ok_or_else(|| {
+            format!(
+                "No review files found for the latest '{}' review run in {}. Run 'bod review' first.",
+                branch,
+                state_dir.display()
+            )
+        })?;
+
+    println!(
+        "\nConsolidating latest '{}' review run ({} file(s))...",
+        branch,
+        selected_files.len()
+    );
+
+    write_selected_reviews(
+        &repo_root,
+        &state_dir,
+        &selected_files,
+        &config.consolidate.model,
+    )
+    .await
+}
+
+async fn write_selected_reviews(
+    repo_root: &Path,
+    state_dir: &Path,
+    selected_files: &[String],
+    model: &str,
+) -> Result<(), String> {
     let branch = git::current_branch()?;
     let sanitized = agents::sanitize_branch_name(&branch);
     let number = agents::next_consolidated_number(&state_dir, &sanitized);
@@ -90,7 +150,7 @@ pub async fn run(config: &Config) -> Result<(), String> {
         &out_path,
         false,
         "",
-        &config.consolidate.model,
+        model,
     )
     .await?;
 
@@ -247,7 +307,9 @@ You have been given reviews from different AI agents who independently reviewed 
 4. **Final Verdict**: Provide a brief overall assessment and prioritized list of what the developer should fix first.
 
 Format as clean, readable markdown. Be concise and actionable.
-- Never run git commands. Never create commits. Never push.
+- Do NOT run `git commit` or `git push`.
+- Read-only git commands for research are allowed when helpful (for example `git status`, `git diff`, `git log`, and `git show`).
+- Avoid any git command that changes the checked-out branch, commit history, index, or working tree unless it is strictly temporary research and you restore the branch to exactly the same uncommitted state and history it had before.
 - Use the supplied review files and bugfix log only as tooling inputs for synthesis.
 - Do not treat their filenames, paths, or mere presence as repository defects.
 - Only write the requested consolidated report file.

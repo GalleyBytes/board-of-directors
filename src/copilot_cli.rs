@@ -8,12 +8,13 @@ pub fn command(prompt: &str, model: &str, repo_root: &Path, state_dir: &Path) ->
         .arg(prompt)
         .arg("--model")
         .arg(model)
-        .arg("--allow-all-tools")
+        .arg("--allow-all")
         .arg("--add-dir")
         .arg(repo_root)
         .arg("--add-dir")
         .arg(state_dir)
-        .arg("--deny-tool=shell(git:*)")
+        .arg("--deny-tool=shell(git commit)")
+        .arg("--deny-tool=shell(git push)")
         .arg("--no-ask-user")
         .arg("--autopilot");
     command

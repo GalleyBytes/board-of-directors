@@ -23,8 +23,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run parallel code reviews with multiple AI agents
-    Review,
+    /// Run parallel code reviews or consolidate the latest review run
+    Review {
+        #[command(subcommand)]
+        command: Option<ReviewCommands>,
+    },
     /// Consolidate review findings into a unified report
     Consolidate,
     /// Autonomous review-fix loop until issues are resolved
@@ -47,6 +50,12 @@ enum Commands {
         #[arg(short, long)]
         reconfigure: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ReviewCommands {
+    /// Consolidate the latest review run for the current branch
+    Consolidate,
 }
 
 #[tokio::main]
@@ -95,7 +104,10 @@ async fn main() {
     let config = config::load(&repo_root);
 
     let result = match cli.command {
-        Commands::Review => review::run(&config).await.map_err(|e| e.to_string()),
+        Commands::Review { command: None } => review::run(&config).await.map_err(|e| e.to_string()),
+        Commands::Review {
+            command: Some(ReviewCommands::Consolidate),
+        } => consolidate::run_latest(&config).await,
         Commands::Consolidate => consolidate::run(&config).await,
         Commands::Bugfix { timeout, severity } => {
             match bugfix::SeverityLevel::from_str(&severity) {
@@ -109,5 +121,29 @@ async fn main() {
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_plain_review_command() {
+        let cli = Cli::try_parse_from(["bod", "review"]).unwrap();
+
+        assert!(matches!(cli.command, Commands::Review { command: None }));
+    }
+
+    #[test]
+    fn parses_review_consolidate_subcommand() {
+        let cli = Cli::try_parse_from(["bod", "review", "consolidate"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Review {
+                command: Some(ReviewCommands::Consolidate)
+            }
+        ));
     }
 }
