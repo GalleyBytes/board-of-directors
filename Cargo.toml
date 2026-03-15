@@ -1,0 +1,15 @@
+[package]
+name = "board-of-directors"
+version = "0.2.0"
+edition = "2024"
+
+[[bin]]
+name = "bod"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["process", "fs", "rt-multi-thread", "macros", "io-util"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
