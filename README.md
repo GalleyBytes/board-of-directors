@@ -6,6 +6,13 @@ Board of Directors (`bod`) is a multi-agent code-review CLI that runs parallel A
 
 - Copilot CLI installed and available in the environment
 
+## Installation
+
+```bash
+brew tap GalleyBytes/tap
+brew install bod
+```
+
 ## Commands
 
 `bod review`
