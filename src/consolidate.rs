@@ -1,5 +1,6 @@
 use crate::agents;
 use crate::backend;
+use crate::bugfix_log;
 use crate::config::{Backend, Config};
 use crate::files;
 use crate::git;
@@ -153,8 +154,9 @@ async fn write_selected_reviews(
     sanitized_branch: &str,
 ) -> Result<(), String> {
     let timestamp = agents::timestamp_now();
-    let (out_filename, mut guard) = agents::create_consolidated_file(&state_dir, sanitized_branch, &timestamp)
-        .map_err(|e| format!("Failed to reserve consolidated file: {}", e))?;
+    let (out_filename, mut guard) =
+        agents::create_consolidated_file(&state_dir, sanitized_branch, &timestamp)
+            .map_err(|e| format!("Failed to reserve consolidated file: {}", e))?;
     let out_path = state_dir.join(&out_filename);
 
     let stdout = run_consolidation(
@@ -164,6 +166,7 @@ async fn write_selected_reviews(
         &selected_files,
         &out_path,
         false,
+        "",
         "",
         model,
     )
@@ -214,7 +217,9 @@ pub async fn run_auto(
     sanitized_branch: &str,
 ) -> Result<String, String> {
     let all_files = match review_timestamp {
-        Some(ts) => agents::list_review_files_for_round_id(bod_dir, ts, Some(sanitized_branch), codenames),
+        Some(ts) => {
+            agents::list_review_files_for_round_id(bod_dir, ts, Some(sanitized_branch), codenames)
+        }
         None => agents::list_review_files(bod_dir),
     };
     if all_files.is_empty() {
@@ -224,13 +229,14 @@ pub async fn run_auto(
     let timestamp = review_timestamp
         .map(|ts| ts.to_string())
         .unwrap_or_else(agents::timestamp_now);
-    let (out_filename, mut guard) = agents::create_consolidated_file(bod_dir, sanitized_branch, &timestamp)
-        .map_err(|e| format!("Failed to reserve consolidated file: {}", e))?;
+    let (out_filename, mut guard) =
+        agents::create_consolidated_file(bod_dir, sanitized_branch, &timestamp)
+            .map_err(|e| format!("Failed to reserve consolidated file: {}", e))?;
     let out_path = bod_dir.join(&out_filename);
 
     // Read bugfix log for the current branch, migrating from the legacy
     // global log if the branch-scoped file does not yet exist.
-    let bugfix_log = files::read_bugfix_log_with_migration(bod_dir, sanitized_branch)?;
+    let bugfix_log = bugfix_log::read_log_parts_with_migration(bod_dir, sanitized_branch)?;
 
     println!("  Consolidating {} review file(s)...", all_files.len());
 
@@ -241,7 +247,8 @@ pub async fn run_auto(
         &all_files,
         &out_path,
         true,
-        &bugfix_log,
+        &bugfix_log.history,
+        &bugfix_log.notes,
         consolidate_model,
     )
     .await?;
@@ -292,6 +299,7 @@ async fn run_consolidation(
     out_path: &Path,
     severity_tags: bool,
     bugfix_log: &str,
+    user_notes: &str,
     model: &str,
 ) -> Result<String, String> {
     let mut reviews_content = String::new();
@@ -358,6 +366,25 @@ has already been fixed according to this log, use the -RESOLVED suffix on its se
         String::new()
     };
 
+    let user_notes_section = if !user_notes.trim().is_empty() {
+        format!(
+            r#"
+
+IMPORTANT CONTEXT -- Operator notes for the NEXT iteration:
+The following notes were written by the human while `bod bugfix` was running.
+Treat them as additional context for prioritization and investigation, but do not
+invent issues that are unsupported by the reviews or code.
+
+--- User Notes ---
+{}
+--- End User Notes ---
+"#,
+            user_notes
+        )
+    } else {
+        String::new()
+    };
+
     let prompt = format!(
         r#"You are a senior engineering lead consolidating code review feedback from multiple independent reviewers.
 
@@ -375,7 +402,7 @@ Format as clean, readable markdown. Be concise and actionable.
 - Use the supplied review files and bugfix log only as tooling inputs for synthesis.
 - Do not treat their filenames, paths, or mere presence as repository defects.
 - Only write the requested consolidated report file.
-{severity_instruction}{bugfix_log_section}
+ {severity_instruction}{bugfix_log_section}{user_notes_section}
 Write the complete consolidated report to: {out_path_str}
 
 Here are the individual reviews:
@@ -389,7 +416,8 @@ Here are the individual reviews:
             if backend::is_arg_too_long(&e) {
                 "Prompt exceeds OS argument-size limit (E2BIG). \
                  The diff may be too large for command-line passing. \
-                 Consider reviewing a smaller changeset.".to_string()
+                 Consider reviewing a smaller changeset."
+                    .to_string()
             } else {
                 format!("Failed to start agent for consolidation: {}", e)
             }

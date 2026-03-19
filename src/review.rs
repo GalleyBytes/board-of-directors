@@ -1,5 +1,6 @@
 use crate::agents;
 use crate::backend;
+use crate::bugfix_session::BugfixSession;
 use crate::config::{Backend, Config};
 use crate::files;
 use crate::git;
@@ -105,10 +106,9 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
     // detached zombies. Tokio tasks are NOT cancelled when a JoinHandle is dropped.
     let mut reserved: Vec<(String, PathBuf, agents::ReservedFile, String, String)> = Vec::new();
     for entry in &config.review.models {
-        let (filename, guard) = agents::create_review_file(
-            &state_dir, &entry.codename, &sanitized, &timestamp,
-        )
-        .map_err(|e| ReviewError::fatal(format!("Failed to reserve review file: {}", e)))?;
+        let (filename, guard) =
+            agents::create_review_file(&state_dir, &entry.codename, &sanitized, &timestamp)
+                .map_err(|e| ReviewError::fatal(format!("Failed to reserve review file: {}", e)))?;
         let output_path = state_dir.join(&filename);
         reserved.push((
             filename,
@@ -129,7 +129,13 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
 
         let handle = tokio::spawn(async move {
             run_agent_review(
-                &backend, &repo_root, &state_dir, &codename, &model_id, &diff_text, &output_path,
+                &backend,
+                &repo_root,
+                &state_dir,
+                &codename,
+                &model_id,
+                &diff_text,
+                &output_path,
                 guard,
             )
             .await
@@ -195,6 +201,173 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
     }
 }
 
+pub async fn run_for_bugfix(
+    config: &Config,
+    session: &BugfixSession,
+) -> Result<String, ReviewError> {
+    let repo_root = git::repo_root().map_err(ReviewError::fatal)?;
+    let state_dir = files::ensure_state_dir(&repo_root).map_err(ReviewError::fatal)?;
+
+    let default_branch = git::detect_default_branch().map_err(ReviewError::fatal)?;
+    let branch = git::current_branch().map_err(ReviewError::fatal)?;
+    let sanitized = agents::sanitize_branch_name(&branch).ok_or_else(|| {
+        ReviewError::fatal(format!(
+            "Branch name '{}' contains no alphanumeric characters and cannot be used \
+             for review filenames. Please use a branch with at least one alphanumeric character.",
+            branch
+        ))
+    })?;
+    let timestamp = agents::timestamp_now();
+
+    println!(
+        "Reviewing branch '{}' against '{}'...",
+        branch, default_branch
+    );
+    session
+        .begin_review(config.review.models.len() as u32)
+        .await;
+
+    let diff = git::generate_diff(&default_branch).map_err(ReviewError::fatal)?;
+
+    let max_diff_len = 100_000;
+    let truncated_diff: String;
+    let diff_for_prompt = if diff.len() > max_diff_len {
+        println!(
+            "Warning: diff is large ({} bytes), truncating to {} bytes for review.",
+            diff.len(),
+            max_diff_len
+        );
+        truncated_diff = format!(
+            "{}\n\n... [diff truncated at {} bytes; original size {} bytes] ...",
+            &diff[..diff.floor_char_boundary(max_diff_len)],
+            max_diff_len,
+            diff.len()
+        );
+        truncated_diff.as_str()
+    } else {
+        &diff
+    };
+
+    let mut reserved: Vec<(String, PathBuf, agents::ReservedFile, String, String)> = Vec::new();
+    for entry in &config.review.models {
+        let (filename, guard) =
+            agents::create_review_file(&state_dir, &entry.codename, &sanitized, &timestamp)
+                .map_err(|e| ReviewError::fatal(format!("Failed to reserve review file: {}", e)))?;
+        let output_path = state_dir.join(&filename);
+        reserved.push((
+            filename,
+            output_path,
+            guard,
+            entry.model.clone(),
+            entry.codename.clone(),
+        ));
+    }
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for (filename, output_path, guard, model_id, codename) in reserved {
+        let diff_text = diff_for_prompt.to_string();
+        let repo_root = repo_root.clone();
+        let state_dir = state_dir.clone();
+        let backend = config.backend;
+        join_set.spawn(async move {
+            (
+                filename,
+                codename.clone(),
+                run_agent_review(
+                    &backend,
+                    &repo_root,
+                    &state_dir,
+                    &codename,
+                    &model_id,
+                    &diff_text,
+                    &output_path,
+                    guard,
+                )
+                .await,
+            )
+        });
+    }
+
+    let mut cancel_rx = session.subscribe_cancel();
+    let mut success_count = 0;
+    let mut fail_count = 0;
+    let mut has_fatal = false;
+    let mut fatal_message = String::new();
+
+    loop {
+        let next = tokio::select! {
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    join_set.abort_all();
+                    session.set_message("Cancelling reviewer tasks...").await;
+                    return Err(ReviewError::retryable("Review cancelled from the browser UI."));
+                }
+                continue;
+            }
+            joined = join_set.join_next() => joined,
+        };
+
+        let Some(joined) = next else {
+            break;
+        };
+
+        match joined {
+            Ok((filename, codename, Ok(()))) => {
+                println!("  [ok] {}", filename);
+                session.note_review_agent_result(&codename, true, None).await;
+                success_count += 1;
+            }
+            Ok((filename, codename, Err(e))) => {
+                eprintln!("  [FAIL] {}: {}", filename, e);
+                let reason = e.to_string();
+                session
+                    .note_review_agent_result(&codename, false, Some(&reason))
+                    .await;
+                if e.is_fatal() && !has_fatal {
+                    has_fatal = true;
+                    fatal_message = reason;
+                }
+                fail_count += 1;
+            }
+            Err(e) => {
+                eprintln!("  [FAIL] reviewer task panicked or was aborted: {}", e);
+                fail_count += 1;
+            }
+        }
+    }
+
+    println!(
+        "\nReview complete: {} succeeded, {} failed.",
+        success_count, fail_count
+    );
+    if success_count > 0 {
+        session.finish_review_round(&timestamp).await;
+    }
+
+    if fail_count > 0 {
+        if has_fatal {
+            return Err(ReviewError::fatal(fatal_message));
+        }
+        if success_count > 0 {
+            Err(ReviewError::retryable_with_timestamp(
+                format!(
+                    "{} of {} agent(s) failed.",
+                    fail_count,
+                    fail_count + success_count
+                ),
+                timestamp,
+            ))
+        } else {
+            Err(ReviewError::retryable(format!(
+                "{} agent(s) failed.",
+                fail_count
+            )))
+        }
+    } else {
+        Ok(timestamp)
+    }
+}
+
 async fn run_agent_review(
     backend: &Backend,
     repo_root: &Path,
@@ -240,7 +413,7 @@ Here is the diff to review:
                 ReviewError::fatal(
                     "Prompt exceeds OS argument-size limit (E2BIG). \
                      The diff may be too large for command-line passing. \
-                     Consider reviewing a smaller changeset."
+                     Consider reviewing a smaller changeset.",
                 )
             } else {
                 ReviewError::retryable(format!("{} failed to start agent: {}", codename, e))
@@ -280,11 +453,9 @@ Here is the diff to review:
         // Disarm the guard first: the file has valid content regardless of whether
         // the optional ANSI cleanup succeeds.
         guard.disarm();
-        let raw = tokio::fs::read_to_string(output_path)
-            .await
-            .map_err(|e| {
-                ReviewError::retryable(format!("{} failed to read review file: {}", codename, e))
-            })?;
+        let raw = tokio::fs::read_to_string(output_path).await.map_err(|e| {
+            ReviewError::retryable(format!("{} failed to read review file: {}", codename, e))
+        })?;
         let clean = backend::strip_ansi_codes(&raw);
         if clean != raw {
             if let Err(e) = tokio::fs::write(output_path, clean.as_bytes()).await {

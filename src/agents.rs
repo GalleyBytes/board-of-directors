@@ -405,7 +405,7 @@ fn split_round_prefix(stem: &str) -> Option<(&str, &str)> {
 /// Extract the round identifier prefix from a filename.
 /// Returns the full round ID (timestamp + optional nonce) for grouping/matching.
 /// Also accepts legacy 12-digit timestamps for backwards compatibility.
-fn extract_timestamp(filename: &str) -> Option<&str> {
+pub fn extract_timestamp(filename: &str) -> Option<&str> {
     let stem = filename.strip_suffix(".md")?;
     split_round_prefix(stem).map(|(round_id, _)| round_id)
 }
@@ -423,7 +423,7 @@ fn extract_timestamp_prefix(filename: &str) -> Option<&str> {
 /// Return the calendar-order portion of a round ID (stripping the random nonce).
 /// For IDs like `20260316153045n003d1a2b3c4d`, returns `20260316153045`.
 /// For plain timestamps (`20260316153045`, `202603161530`), returns the full ID.
-fn round_id_sort_key(round_id: &str) -> &str {
+pub fn round_id_sort_key(round_id: &str) -> &str {
     if round_id.len() > 14 && round_id.as_bytes()[14] == b'n' {
         &round_id[..14]
     } else {
@@ -497,6 +497,59 @@ pub fn list_review_files(bod_dir: &Path) -> Vec<String> {
     files
 }
 
+/// List review files for the current branch only.
+/// Uses configured codenames so branch suffixes are parsed without ambiguity.
+pub fn list_review_files_for_branch(
+    bod_dir: &Path,
+    sanitized_branch: &str,
+    codenames: &[String],
+) -> Vec<String> {
+    list_review_files(bod_dir)
+        .into_iter()
+        .filter(|file| review_file_matches_branch(file, codenames, sanitized_branch))
+        .collect()
+}
+
+/// Check whether a review filename belongs to the given branch.
+/// Handles both timestamped and legacy review filenames.
+pub fn review_file_matches_branch(
+    filename: &str,
+    codenames: &[String],
+    sanitized_branch: &str,
+) -> bool {
+    if sanitized_branch.is_empty() {
+        return false;
+    }
+
+    let sorted_cn = sort_codenames_longest_first(codenames);
+    review_file_matches_branch_with_sorted_codenames(filename, &sorted_cn, sanitized_branch)
+}
+
+/// List consolidated reports for the current branch only.
+/// Supports both timestamped and legacy consolidated filenames.
+pub fn list_consolidated_files_for_branch(bod_dir: &Path, sanitized_branch: &str) -> Vec<String> {
+    if sanitized_branch.is_empty() {
+        return Vec::new();
+    }
+
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(bod_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let stem = name.strip_suffix(".md").unwrap_or(&name);
+            if name.ends_with(".md")
+                && is_consolidated_file(&name)
+                && consolidated_stem_matches_branch(stem, sanitized_branch)
+            {
+                files.push(name);
+            }
+        }
+    }
+
+    files.sort();
+    files
+}
+
 /// Sort codenames longest-first for prefix-ambiguity resolution.
 /// Call once and pass the result to `stem_matches_branch` to avoid
 /// re-sorting on every invocation.
@@ -536,6 +589,64 @@ fn stem_matches_branch(stem: &str, prefix: &str, sorted_codenames: &[&str], bran
         // fall through to try shorter codenames.
     }
     false
+}
+
+fn legacy_review_file_matches_branch(
+    stem: &str,
+    sorted_codenames: &[&str],
+    sanitized_branch: &str,
+) -> bool {
+    for cn in sorted_codenames {
+        let expected_prefix = format!("{}-", cn);
+        if !stem.starts_with(&expected_prefix) {
+            continue;
+        }
+
+        let remaining = &stem[expected_prefix.len()..];
+        return remaining == sanitized_branch
+            || remaining
+                .strip_prefix(sanitized_branch)
+                .map_or(false, |rest| is_collision_suffix(rest));
+    }
+
+    false
+}
+
+fn review_file_matches_branch_with_sorted_codenames(
+    filename: &str,
+    sorted_codenames: &[&str],
+    sanitized_branch: &str,
+) -> bool {
+    let stem = filename.strip_suffix(".md").unwrap_or(filename);
+    if let Some(round_id) = extract_timestamp(filename) {
+        let prefix = format!("{}-", round_id);
+        return stem_matches_branch(stem, &prefix, sorted_codenames, sanitized_branch);
+    }
+
+    legacy_review_file_matches_branch(stem, sorted_codenames, sanitized_branch)
+}
+
+fn consolidated_name_matches_branch(rest: &str, sanitized_branch: &str) -> bool {
+    rest == sanitized_branch
+        || rest
+            .strip_prefix(sanitized_branch)
+            .map_or(false, |suffix| is_collision_suffix(suffix))
+}
+
+fn consolidated_stem_matches_branch(stem: &str, sanitized_branch: &str) -> bool {
+    if sanitized_branch.is_empty() {
+        return false;
+    }
+
+    if let Some(rest) = stem.strip_prefix("consolidated-") {
+        return consolidated_name_matches_branch(rest, sanitized_branch);
+    }
+
+    split_round_prefix(stem)
+        .and_then(|(_, rest)| rest.strip_prefix("consolidated-"))
+        .map_or(false, |rest| {
+            consolidated_name_matches_branch(rest, sanitized_branch)
+        })
 }
 
 /// List review files that match a specific round ID and optionally a branch name.
@@ -659,25 +770,11 @@ pub fn latest_review_files(
     // Accept both `~N` (new) and `-N` (pre-iteration-10) collision suffixes.
     // Reuse sorted_cn computed above.
     if let Some(legacy_files) = groups.get("legacy") {
-
         let matching: Vec<String> = legacy_files
             .iter()
             .filter(|f| {
                 let stem = f.strip_suffix(".md").unwrap_or(f);
-                for cn in &sorted_cn {
-                    let expected_prefix = format!("{}-", cn);
-                    if !stem.starts_with(&expected_prefix) {
-                        continue;
-                    }
-                    let remaining = &stem[expected_prefix.len()..];
-                    return remaining == sanitized_branch
-                        || remaining
-                            .strip_prefix(sanitized_branch)
-                            .map_or(false, |rest| {
-                                is_collision_suffix(rest)
-                            });
-                }
-                false
+                legacy_review_file_matches_branch(stem, &sorted_cn, sanitized_branch)
             })
             .cloned()
             .collect();
@@ -930,6 +1027,70 @@ mod tests {
 
         let files = list_review_files(dir.path());
         assert_eq!(files, vec!["20260316153045-opus-feature.md"]);
+    }
+
+    #[test]
+    fn review_file_matches_branch_avoids_branch_suffix_false_positive() {
+        let codenames = vec!["opus".to_string()];
+        assert!(!review_file_matches_branch(
+            "20260316153045-opus-my-feature.md",
+            &codenames,
+            "feature"
+        ));
+        assert!(review_file_matches_branch(
+            "20260316153045-opus-my-feature.md",
+            &codenames,
+            "my-feature"
+        ));
+    }
+
+    #[test]
+    fn list_review_files_for_branch_filters_current_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
+        fs::write(dir.path().join("20260316153045-codex-feature.md"), "").unwrap();
+        fs::write(dir.path().join("20260316153045-opus-other.md"), "").unwrap();
+        fs::write(dir.path().join("opus-feature.md"), "").unwrap();
+        fs::write(dir.path().join("20260316153045-consolidated-feature.md"), "").unwrap();
+        fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
+
+        let files = list_review_files_for_branch(
+            dir.path(),
+            "feature",
+            &["codex".to_string(), "opus".to_string()],
+        );
+        assert_eq!(
+            files,
+            vec![
+                "20260316153045-codex-feature.md",
+                "20260316153045-opus-feature.md",
+                "opus-feature.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_consolidated_files_for_branch_filters_current_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("20260316153045-consolidated-feature.md"), "").unwrap();
+        fs::write(
+            dir.path().join("20260316153045n000000000001-consolidated-feature~2.md"),
+            "",
+        )
+        .unwrap();
+        fs::write(dir.path().join("consolidated-feature-2.md"), "").unwrap();
+        fs::write(dir.path().join("20260316153045-consolidated-other.md"), "").unwrap();
+        fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
+
+        let files = list_consolidated_files_for_branch(dir.path(), "feature");
+        assert_eq!(
+            files,
+            vec![
+                "20260316153045-consolidated-feature.md",
+                "20260316153045n000000000001-consolidated-feature~2.md",
+                "consolidated-feature-2.md",
+            ]
+        );
     }
 
     #[test]

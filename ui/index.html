@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>bod bugfix live session</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/typescript/5.6.3/typescript.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/lib/common.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github.min.css">
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Segoe UI", Arial, sans-serif;
+      font-weight: 400;
+    }
+
+    .glass-panel {
+      background: rgba(10, 16, 26, 0.98);
+      box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03), 0 3px 0 rgba(2, 6, 23, 0.26), 0 12px 20px rgba(2, 6, 23, 0.16);
+    }
+
+    .button-slide {
+      overflow: hidden;
+      position: relative;
+      isolation: isolate;
+      transition: color 0.25s ease, transform 0.25s ease;
+    }
+
+    .button-slide::before {
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      transform: translateX(-102%);
+      transition: transform 0.28s ease;
+      content: "";
+    }
+
+    .button-slide:hover:not(:disabled)::before,
+    .button-slide:focus-visible:not(:disabled)::before {
+      transform: translateX(0);
+    }
+
+    .button-slide:hover:not(:disabled),
+    .button-slide:focus-visible:not(:disabled) {
+      transform: translateY(-1px);
+    }
+
+    .button-slide-light::before {
+      background: rgba(255, 255, 255, 0.94);
+    }
+
+    .button-slide-accent::before {
+      background: rgba(165, 243, 252, 0.96);
+    }
+
+    .button-slide-danger::before {
+      background: rgba(254, 205, 211, 0.96);
+    }
+
+    .button-slide-subtle::before {
+      background: rgba(100, 116, 139, 0.9);
+    }
+
+    .markdown-body {
+      color: rgba(15, 23, 42, 0.96);
+    }
+
+    .markdown-body pre {
+      padding: 1rem;
+      overflow-x: auto;
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid rgba(148, 163, 184, 0.55);
+      margin: 1.25rem 0;
+    }
+
+    .markdown-body pre code {
+      background: transparent;
+      padding: 0;
+      border-radius: 0;
+      font-size: 0.875rem;
+      line-height: 1.7;
+    }
+
+    .markdown-body code:not(pre code) {
+      padding: 0.15rem 0.35rem;
+      background: rgba(226, 232, 240, 0.92);
+      color: rgba(15, 23, 42, 0.98);
+      font-size: 0.875em;
+    }
+
+    .markdown-body h1 {
+      font-size: 1.75rem;
+      font-weight: 500;
+      margin: 2rem 0 1rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid rgba(100, 116, 139, 0.34);
+    }
+
+    .markdown-body h2 {
+      font-size: 1.4rem;
+      font-weight: 500;
+      margin: 1.75rem 0 0.75rem;
+      padding-bottom: 0.4rem;
+      border-bottom: 1px solid rgba(100, 116, 139, 0.28);
+    }
+
+    .markdown-body h3 {
+      font-size: 1.15rem;
+      font-weight: 500;
+      margin: 1.5rem 0 0.5rem;
+    }
+
+    .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+      font-size: 1rem;
+      font-weight: 500;
+      margin: 1.25rem 0 0.5rem;
+    }
+
+    .markdown-body p {
+      margin: 0.75rem 0;
+      line-height: 1.75;
+    }
+
+    .markdown-body blockquote {
+      border-left: 3px solid rgba(34, 211, 238, 0.4);
+      background: rgba(226, 232, 240, 0.78);
+      margin: 1rem 0;
+      padding: 0.75rem 1rem;
+      color: rgba(30, 41, 59, 0.95);
+    }
+
+    .markdown-body blockquote p {
+      margin: 0.25rem 0;
+    }
+
+    .markdown-body ul, .markdown-body ol {
+      margin: 0.75rem 0;
+      padding-left: 1.75rem;
+    }
+
+    .markdown-body ul {
+      list-style-type: disc;
+    }
+
+    .markdown-body ol {
+      list-style-type: decimal;
+    }
+
+    .markdown-body li {
+      margin: 0.35rem 0;
+      line-height: 1.7;
+    }
+
+    .markdown-body li > ul, .markdown-body li > ol {
+      margin: 0.25rem 0;
+    }
+
+    .markdown-body hr {
+      border: none;
+      border-top: 1px solid rgba(100, 116, 139, 0.3);
+      margin: 1.5rem 0;
+    }
+
+    .markdown-body a {
+      color: rgba(3, 105, 161, 1);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+
+    .markdown-body a:hover {
+      text-decoration: underline;
+      color: rgba(2, 132, 199, 1);
+    }
+
+    .markdown-body img {
+      max-width: 100%;
+      margin: 1rem 0;
+    }
+
+    .markdown-body table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0;
+    }
+
+    .markdown-body th {
+      background: rgba(226, 232, 240, 0.9);
+      font-weight: 500;
+      text-align: left;
+    }
+
+    .markdown-body th,
+    .markdown-body td {
+      border: 1px solid rgba(148, 163, 184, 0.45);
+      padding: 0.6rem 0.75rem;
+    }
+
+    .markdown-body tr:nth-child(even) {
+      background: rgba(241, 245, 249, 0.72);
+    }
+
+    .markdown-body strong {
+      color: rgba(15, 23, 42, 1);
+    }
+
+    ::-webkit-scrollbar {
+      width: 11px;
+      height: 11px;
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: rgba(100, 116, 139, 0.7);
+    }
+
+    ::-webkit-scrollbar-track {
+      background: rgba(6, 10, 18, 0.85);
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-[#314052] text-slate-100">
+  <div id="app" class="relative"></div>
+  <script>
+    window.__CSRF_TOKEN__ = "{{CSRF_TOKEN}}";
+    const appRoot = document.getElementById("app");
+
+    function renderBootError(error) {
+      appRoot.innerHTML = `
+        <main class="mx-auto flex min-h-screen max-w-3xl items-center justify-center px-6 py-16">
+          <section class="glass-panel w-full border border-rose-950/25 p-8">
+            <p class="mb-2 text-sm font-medium uppercase tracking-[0.28em] text-rose-300">bod bugfix ui failed to load</p>
+            <h1 class="mb-4 text-3xl font-medium text-white">The local dashboard could not start.</h1>
+            <p class="mb-6 text-sm leading-7 text-slate-300">This UI depends on browser-loaded React, TypeScript, Tailwind, and markdown assets. Check your network access or browser console, then refresh this page.</p>
+            <pre class="overflow-x-auto border border-slate-950/20 bg-slate-900/80 p-4 text-sm text-slate-200">${String(error)}</pre>
+          </section>
+        </main>
+      `;
+    }
+
+    (async function boot() {
+      try {
+        const response = await fetch("/assets/app.tsx", { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`Failed to fetch app.tsx: ${response.status}`);
+        }
+        const source = await response.text();
+        const compiled = ts.transpileModule(source, {
+          compilerOptions: {
+            target: ts.ScriptTarget.ES2020,
+            module: ts.ModuleKind.None,
+            jsx: ts.JsxEmit.React,
+            strict: false,
+          },
+        }).outputText;
+        new Function(compiled)();
+      } catch (error) {
+        console.error(error);
+        renderBootError(error);
+      }
+    })();
+  </script>
+</body>
+</html>

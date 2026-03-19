@@ -27,7 +27,15 @@ Consolidate the latest review round for the current branch into a single report.
 Consolidate review findings (non-branch-specific).
 
 `bod bugfix --timeout <seconds> --severity <critical|high|medium|low>`
-Run the autonomous review-fix loop. Example: `bod bugfix --timeout 3600 --severity high`
+Run the autonomous review-fix loop. When bugfix mode starts, `bod` also launches a localhost dashboard on a random port in `20000..=29999` and opens it in your browser. The dashboard shows iteration progress, the session timeout countdown, the current and next severity thresholds, rendered markdown artifacts with syntax highlighting, an editable user-notes section stored inside the bugfix log, and a cancel control that stops the run and reverts current-iteration fix changes. Example: `bod bugfix --timeout 3600 --severity high`
+
+## Bugfix dashboard
+
+`bod bugfix` now serves a browser UI while the loop is running. Use it to watch review progress, inspect the latest consolidated report and bugfix log, leave notes for the next consolidation pass, change the severity threshold for the next iteration, or cancel the current run.
+
+If automatic browser launch fails, open the printed `http://127.0.0.1:<port>/` URL manually.
+
+The localhost control plane is served by `bod`, but the browser UI currently bootstraps React, TypeScript, Tailwind, markdown rendering, and syntax highlighting from CDN assets at runtime. The CLI loop still works without that browser-side network access, but the dashboard will not render fully if those browser fetches are blocked.
 
 `bod init [--global] [--reconfigure]`
 Interactive model/config setup. `--global` writes to `~/.config/board-of-directors/.bodrc.toml`
@@ -66,4 +74,3 @@ $HOME/.config/board-of-directors/<repo-scope>/
 ```
 
 Replaces `<repo-scope>` with a sanitized form of the repo directory name. 
-

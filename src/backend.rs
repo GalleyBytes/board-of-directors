@@ -4,6 +4,9 @@ use crate::copilot_cli;
 use regex::Regex;
 use std::path::Path;
 use std::sync::OnceLock;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 /// Null device path, platform-specific. Used to override git config paths.
 pub const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -50,6 +53,18 @@ pub const DENIED_GIT_SUBCOMMANDS: &[&str] = &[
 /// Default agent timeout: 10 minutes.
 const AGENT_TIMEOUT_SECS: u64 = 600;
 
+pub enum AgentRunResult {
+    Completed(std::process::Output),
+    Cancelled,
+}
+
+struct RunningAgent {
+    child: tokio::process::Child,
+    stdout_handle: JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_handle: JoinHandle<std::io::Result<Vec<u8>>>,
+    stdin_handle: Option<JoinHandle<std::io::Result<()>>>,
+}
+
 pub async fn run_agent(
     backend: &Backend,
     prompt: &str,
@@ -57,33 +72,45 @@ pub async fn run_agent(
     repo_root: &Path,
     state_dir: &Path,
 ) -> std::io::Result<std::process::Output> {
-    let timeout_dur = std::time::Duration::from_secs(AGENT_TIMEOUT_SECS);
-    match tokio::time::timeout(timeout_dur, run_agent_inner(backend, prompt, model, repo_root, state_dir)).await {
-        Ok(result) => result,
-        Err(_elapsed) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!(
-                "Agent timed out after {} seconds. The child process may be hung \
-                 (network stall, API outage, or infinite tool-use loop).",
-                AGENT_TIMEOUT_SECS
-            ),
+    match run_agent_inner_with_cancel(backend, prompt, model, repo_root, state_dir, None).await? {
+        AgentRunResult::Completed(output) => Ok(output),
+        AgentRunResult::Cancelled => Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "Agent was cancelled.",
         )),
     }
 }
 
-async fn run_agent_inner(
+pub async fn run_agent_cancellable(
     backend: &Backend,
     prompt: &str,
     model: &str,
     repo_root: &Path,
     state_dir: &Path,
-) -> std::io::Result<std::process::Output> {
-    match backend {
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> std::io::Result<AgentRunResult> {
+    run_agent_inner_with_cancel(backend, prompt, model, repo_root, state_dir, Some(cancel_rx))
+        .await
+}
+
+async fn run_agent_inner_with_cancel(
+    backend: &Backend,
+    prompt: &str,
+    model: &str,
+    repo_root: &Path,
+    state_dir: &Path,
+    mut cancel_rx: Option<&mut watch::Receiver<bool>>,
+) -> std::io::Result<AgentRunResult> {
+    let running = match backend {
         Backend::Copilot => {
             // Copilot passes prompt as a CLI argument; warn about ARG_MAX risk.
             // macOS ARG_MAX is ~1 MiB total (including environment). Warn at
             // a lower threshold there to account for environment overhead.
-            let warn_threshold: usize = if cfg!(target_os = "macos") { 250_000 } else { 900_000 };
+            let warn_threshold: usize = if cfg!(target_os = "macos") {
+                250_000
+            } else {
+                900_000
+            };
             if prompt.len() > warn_threshold {
                 eprintln!(
                     "Warning: prompt is very large ({} bytes). \
@@ -91,61 +118,199 @@ async fn run_agent_inner(
                     prompt.len()
                 );
             }
-            // Use explicit spawn + wait_with_output so the child handle has
-            // kill_on_drop(true). If the timeout fires and this future is
-            // dropped, the child is killed automatically instead of leaking.
-            use std::process::Stdio;
-            let mut cmd = copilot_cli::command(prompt, model, repo_root, state_dir);
-            cmd.stdin(Stdio::null());
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-            cmd.kill_on_drop(true);
-            let child = cmd.spawn()?;
-            child.wait_with_output().await
+            let cmd = copilot_cli::command(prompt, model, repo_root, state_dir);
+            spawn_command(cmd, None)?
         }
         Backend::ClaudeCode => {
-            use std::process::Stdio;
-            use tokio::io::AsyncWriteExt;
-            let mut cmd = claude_cli::command(model, repo_root, state_dir);
-            cmd.stdin(Stdio::piped());
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
-            cmd.kill_on_drop(true);
-            let mut child = cmd.spawn()?;
-            // Spawn stdin write in a separate task so wait_with_output() can
-            // drain stdout/stderr concurrently. Without this, large prompts
-            // that exceed the OS pipe buffer (~64 KiB Linux, ~16 KiB macOS)
-            // deadlock: the parent blocks on write_all waiting for the child
-            // to read stdin, while the child blocks on stdout/stderr writes
-            // waiting for the parent to drain them.
-            let stdin = child.stdin.take();
-            let prompt_owned = prompt.as_bytes().to_vec();
-            let write_handle = tokio::spawn(async move {
-                if let Some(mut stdin) = stdin {
-                    let res = stdin.write_all(&prompt_owned).await;
-                    drop(stdin); // close stdin to signal EOF
-                    res
-                } else {
-                    Ok(())
+            let cmd = claude_cli::command(model, repo_root, state_dir);
+            spawn_command(cmd, Some(prompt.as_bytes().to_vec()))?
+        }
+    };
+
+    run_running_agent(running, cancel_rx.as_deref_mut()).await
+}
+
+fn spawn_command(
+    mut cmd: tokio::process::Command,
+    stdin_payload: Option<Vec<u8>>,
+) -> std::io::Result<RunningAgent> {
+    use std::process::Stdio;
+    cmd.stdin(if stdin_payload.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Agent child stdout was not piped as expected.",
+        )
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Agent child stderr was not piped as expected.",
+        )
+    })?;
+    let stdin_handle = stdin_payload.map(|payload| {
+        let stdin = child.stdin.take();
+        tokio::spawn(async move {
+            if let Some(mut stdin) = stdin {
+                let res = stdin.write_all(&payload).await;
+                drop(stdin);
+                res
+            } else {
+                Ok(())
+            }
+        })
+    });
+
+    Ok(RunningAgent {
+        child,
+        stdout_handle: spawn_reader_task(stdout),
+        stderr_handle: spawn_reader_task(stderr),
+        stdin_handle,
+    })
+}
+
+async fn run_running_agent(
+    mut running: RunningAgent,
+    mut cancel_rx: Option<&mut watch::Receiver<bool>>,
+) -> std::io::Result<AgentRunResult> {
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(AGENT_TIMEOUT_SECS));
+    tokio::pin!(timeout);
+
+    loop {
+        if let Some(cancel_rx_ref) = cancel_rx.as_deref_mut() {
+            tokio::select! {
+                status = running.child.wait() => {
+                    let output = finish_agent_output(status?, running).await?;
+                    return Ok(AgentRunResult::Completed(output));
                 }
-            });
-            let output = child.wait_with_output().await?;
-            // Check write result. BrokenPipe is expected if the child exits
-            // before consuming all input (e.g. early validation failure).
-            match write_handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-                Ok(Err(e)) => return Err(e),
-                Err(join_err) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("stdin writer task panicked: {}", join_err),
-                    ));
+                _ = &mut timeout => {
+                    if let Some(status) = running.child.try_wait()? {
+                        let output = finish_agent_output(status, running).await?;
+                        return Ok(AgentRunResult::Completed(output));
+                    }
+                    let status = kill_and_wait(&mut running.child).await?;
+                    finish_agent_output(status, running).await?;
+                    return Err(timed_out_error());
+                }
+                changed = cancel_rx_ref.changed() => {
+                    match changed {
+                        Ok(()) if *cancel_rx_ref.borrow_and_update() => {
+                            if let Some(status) = running.child.try_wait()? {
+                                let output = finish_agent_output(status, running).await?;
+                                return Ok(AgentRunResult::Completed(output));
+                            }
+                            let status = kill_and_wait(&mut running.child).await?;
+                            finish_agent_output(status, running).await?;
+                            return Ok(AgentRunResult::Cancelled);
+                        }
+                        Err(_) => {
+                            cancel_rx = None;
+                        }
+                        _ => {}
+                    }
                 }
             }
-            Ok(output)
+        } else {
+            tokio::select! {
+                status = running.child.wait() => {
+                    let output = finish_agent_output(status?, running).await?;
+                    return Ok(AgentRunResult::Completed(output));
+                }
+                _ = &mut timeout => {
+                    if let Some(status) = running.child.try_wait()? {
+                        let output = finish_agent_output(status, running).await?;
+                        return Ok(AgentRunResult::Completed(output));
+                    }
+                    let status = kill_and_wait(&mut running.child).await?;
+                    finish_agent_output(status, running).await?;
+                    return Err(timed_out_error());
+                }
+            }
         }
     }
+}
+
+fn spawn_reader_task<R>(mut reader: R) -> JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).await?;
+        Ok(buffer)
+    })
+}
+
+async fn kill_and_wait(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    match child.start_kill() {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+        Err(e) => return Err(e),
+    }
+    child.wait().await
+}
+
+async fn finish_agent_output(
+    status: std::process::ExitStatus,
+    running: RunningAgent,
+) -> std::io::Result<std::process::Output> {
+    let stdout = join_reader_task(running.stdout_handle, "stdout").await?;
+    let stderr = join_reader_task(running.stderr_handle, "stderr").await?;
+
+    if let Some(stdin_handle) = running.stdin_handle {
+        match stdin_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Ok(Err(e)) => return Err(e),
+            Err(join_err) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("stdin writer task panicked: {}", join_err),
+                ));
+            }
+        }
+    }
+
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn join_reader_task(
+    handle: JoinHandle<std::io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> std::io::Result<Vec<u8>> {
+    match handle.await {
+        Ok(result) => result,
+        Err(join_err) => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("agent {} reader task panicked: {}", stream_name, join_err),
+        )),
+    }
+}
+
+fn timed_out_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "Agent timed out after {} seconds. The child process may be hung \
+             (network stall, API outage, or infinite tool-use loop).",
+            AGENT_TIMEOUT_SECS
+        ),
+    )
 }
 
 /// Strip ANSI escape sequences and control characters from a string.
@@ -173,4 +338,36 @@ pub fn strip_ansi_codes(s: &str) -> String {
 /// Check if an I/O error is E2BIG (argument list too long).
 pub fn is_arg_too_long(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::ArgumentListTooLong
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn cancelling_running_agent_prevents_late_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("late-write.txt");
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 2; printf late > \"$OUT_PATH\"")
+            .env("OUT_PATH", &output_path);
+
+        let running = spawn_command(command, None).unwrap();
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            run_running_agent(running, Some(&mut cancel_rx)).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel_tx.send(true).unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(matches!(result, AgentRunResult::Cancelled));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(!output_path.exists());
+    }
 }

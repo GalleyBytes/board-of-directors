@@ -1,6 +1,8 @@
 mod agents;
 mod backend;
 mod bugfix;
+mod bugfix_log;
+mod bugfix_session;
 mod claude_cli;
 mod config;
 mod consolidate;
@@ -10,6 +12,8 @@ mod git;
 mod init;
 mod paths;
 mod review;
+mod rollback;
+mod web;
 
 use clap::{Parser, Subcommand};
 
@@ -40,6 +44,12 @@ enum Commands {
         /// Minimum severity to fix: critical, high, medium, low
         #[arg(long, default_value = "high")]
         severity: String,
+        /// User instructions appended to the bugfix session notes
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Wait for a manual start after opening the dashboard
+        #[arg(long)]
+        delay_start: bool,
     },
     /// Print version information
     Version,
@@ -126,17 +136,23 @@ async fn main() {
     }
 
     let result = match cli.command {
-        Commands::Review { command: None } => review::run(&config).await.map(|_| ()).map_err(|e| e.to_string()),
+        Commands::Review { command: None } => review::run(&config)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
         Commands::Review {
             command: Some(ReviewCommands::Consolidate),
         } => consolidate::run_latest(&config).await,
         Commands::Consolidate => consolidate::run(&config).await,
-        Commands::Bugfix { timeout, severity } => {
-            match bugfix::SeverityLevel::from_str(&severity) {
-                Ok(level) => bugfix::run(timeout, level, &config).await,
-                Err(e) => Err(e),
-            }
-        }
+        Commands::Bugfix {
+            timeout,
+            severity,
+            prompt,
+            delay_start,
+        } => match bugfix::SeverityLevel::from_str(&severity) {
+            Ok(level) => bugfix::run(timeout, level, &config, prompt.as_deref(), delay_start).await,
+            Err(e) => Err(e),
+        },
         Commands::Init { .. } | Commands::Version => unreachable!(),
     };
 
@@ -165,6 +181,19 @@ mod tests {
             cli.command,
             Commands::Review {
                 command: Some(ReviewCommands::Consolidate)
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_bugfix_delay_start_flag() {
+        let cli = Cli::try_parse_from(["bod", "bugfix", "--delay-start"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Commands::Bugfix {
+                delay_start: true,
+                ..
             }
         ));
     }
