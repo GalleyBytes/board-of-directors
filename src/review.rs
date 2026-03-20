@@ -422,6 +422,7 @@ async fn run_agent_review(
     mut guard: agents::ReservedFile,
 ) -> Result<(), ReviewError> {
     let output_path_str = output_path.to_string_lossy().to_string();
+    let repo_root_str = repo_root.to_string_lossy().to_string();
 
     let prompt = format!(
         r#"You are a senior code reviewer. Review the following git diff for a pull request.
@@ -432,11 +433,11 @@ Your task:
 - Prioritize correctness over complexity.
 - Keep your review concise enough for a human to read quickly. Do not be overly verbose.
 - Format your review as markdown.
-        - Do NOT run `git commit` or `git push`.
-        - Read-only git commands for research are allowed when helpful (for example `git status`, `git diff`, `git log`, and `git show`).
-        - Avoid any git command that changes the checked-out branch, commit history, index, or working tree unless it is strictly temporary research and you restore the branch to exactly the same uncommitted state and history it had before.
-        - Treat files under `~/.config/board-of-directors/` as internal board-of-directors tooling state.
-        - Do NOT inspect, reference, or use that tooling state as evidence about repository correctness.
+- Do NOT run `git commit` or `git push`.
+- You may inspect repository files and use read-only git commands for research when helpful. Because your current working directory is tooling state outside the repository, run git commands as `git -C {repo_root_str} <args>` so they target the repository explicitly.
+- Do NOT edit repository files, create files in the repository, or use write tools against repository paths.
+- Your current working directory is board-of-directors tooling state outside the repository.
+- Do NOT inspect, reference, or use that tooling state as evidence about repository correctness.
 - Do NOT reference other reviewers or reviews.
 - The only allowed interaction with tooling state is writing the review file requested below.
 
@@ -449,7 +450,16 @@ Here is the diff to review:
 ```"#
     );
 
-    let output = backend::run_agent(backend, &prompt, model_id, repo_root, state_dir)
+    let output = backend::run_agent(
+        backend,
+        &prompt,
+        model_id,
+        state_dir,
+        true,
+        false,
+        repo_root,
+        state_dir,
+    )
         .await
         .map_err(|e| {
             if backend::is_arg_too_long(&e) {

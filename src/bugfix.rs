@@ -1,7 +1,7 @@
 use crate::agents;
 use crate::backend;
 use crate::bugfix_log;
-use crate::bugfix_session::BugfixSession;
+use crate::bugfix_session::{BugfixSession, SessionStatus};
 use crate::config::{Backend, Config};
 use crate::consolidate;
 use crate::files;
@@ -251,8 +251,9 @@ pub async fn run(
                         ts
                     }
                     None => {
-                        eprintln!("  Continuing to next iteration...");
-                        continue;
+                        let message = terminal_step_failure("Review step failed", e.to_string());
+                        session.mark_error(message.clone()).await;
+                        return Err(message);
                     }
                 }
             }
@@ -325,8 +326,9 @@ pub async fn run(
                 session
                     .fail_consolidation(&consolidate_label, e.to_string())
                     .await;
-                eprintln!("  Continuing to next iteration...");
-                continue;
+                let message = terminal_step_failure("Consolidation failed", e);
+                session.mark_error(message.clone()).await;
+                return Err(message);
             }
             StepOutcome::Cancelled => {
                 session
@@ -446,8 +448,9 @@ pub async fn run(
                     return Err(message);
                 }
                 session.fail_fix(&bugfix_label, e.to_string()).await;
-                eprintln!("  Continuing to next iteration...");
-                continue;
+                let message = terminal_step_failure("Fix step failed", e);
+                session.mark_error(message.clone()).await;
+                return Err(message);
             }
             FixAgentOutcome::Cancelled => {
                 if let Err(e) = restore_fix_step_state(
@@ -498,8 +501,34 @@ pub async fn run(
         }
     }
 
+    let final_snapshot = session.snapshot().await;
     server.shutdown();
-    Ok(())
+
+    final_result_from_status(
+        final_snapshot.status,
+        final_snapshot.last_error.as_deref(),
+        &final_snapshot.latest_message,
+    )
+}
+
+fn terminal_step_failure(prefix: &str, detail: impl Into<String>) -> String {
+    format!("{prefix}: {}", detail.into())
+}
+
+fn final_result_from_status(
+    status: SessionStatus,
+    last_error: Option<&str>,
+    latest_message: &str,
+) -> Result<(), String> {
+    match status {
+        SessionStatus::Error => Err(last_error
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "Bugfix finished with an error state.".to_string())),
+        SessionStatus::TimedOut => Err(last_error
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| latest_message.to_string())),
+        _ => Ok(()),
+    }
 }
 
 fn count_severities(report: &str, included: &[&str]) -> Vec<(String, u32)> {
@@ -512,6 +541,43 @@ fn count_severities(report: &str, included: &[&str]) -> Vec<(String, u32)> {
             (level.to_string(), count)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_step_failure_matches_operator_message() {
+        assert_eq!(
+            terminal_step_failure("Review step failed", "3 agent(s) failed."),
+            "Review step failed: 3 agent(s) failed."
+        );
+    }
+
+    #[test]
+    fn final_result_returns_error_status_message() {
+        assert_eq!(
+            final_result_from_status(SessionStatus::Error, Some("boom"), "ignored"),
+            Err("boom".to_string())
+        );
+    }
+
+    #[test]
+    fn final_result_returns_timeout_message_when_no_error_is_present() {
+        assert_eq!(
+            final_result_from_status(SessionStatus::TimedOut, None, "Timeout reached after review step."),
+            Err("Timeout reached after review step.".to_string())
+        );
+    }
+
+    #[test]
+    fn final_result_accepts_completed_status() {
+        assert_eq!(
+            final_result_from_status(SessionStatus::Completed, None, "done"),
+            Ok(())
+        );
+    }
 }
 
 fn extract_actionable(report: &str, severity: &SeverityLevel) -> String {
@@ -673,6 +739,9 @@ For each fix, write:
         backend,
         &prompt,
         fix_model,
+        repo_root,
+        true,
+        true,
         repo_root,
         state_dir,
         &mut cancel_rx,

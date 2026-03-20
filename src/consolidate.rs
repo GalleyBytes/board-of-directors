@@ -315,6 +315,7 @@ async fn run_consolidation(
     }
 
     let out_path_str = out_path.to_string_lossy().to_string();
+    let repo_root_str = repo_root.to_string_lossy().to_string();
 
     let severity_instruction = if severity_tags {
         r#"
@@ -397,12 +398,13 @@ You have been given reviews from different AI agents who independently reviewed 
 
 Format as clean, readable markdown. Be concise and actionable.
 - Do NOT run `git commit` or `git push`.
-- Read-only git commands for research are allowed when helpful (for example `git status`, `git diff`, `git log`, and `git show`).
-- Avoid any git command that changes the checked-out branch, commit history, index, or working tree unless it is strictly temporary research and you restore the branch to exactly the same uncommitted state and history it had before.
+- You may inspect repository files and use read-only git commands for research when helpful. Because your current working directory is tooling state outside the repository, run git commands as `git -C {repo_root_str} <args>` so they target the repository explicitly.
+- Do NOT edit repository files, create files in the repository, or use write tools against repository paths.
+- Your current working directory is tooling state outside the repository.
 - Use the supplied review files and bugfix log only as tooling inputs for synthesis.
 - Do not treat their filenames, paths, or mere presence as repository defects.
 - Only write the requested consolidated report file.
- {severity_instruction}{bugfix_log_section}{user_notes_section}
+  {severity_instruction}{bugfix_log_section}{user_notes_section}
 Write the complete consolidated report to: {out_path_str}
 
 Here are the individual reviews:
@@ -410,7 +412,7 @@ Here are the individual reviews:
 {reviews_content}"#
     );
 
-    let output = backend::run_agent(backend, &prompt, model, repo_root, bod_dir)
+    let output = backend::run_agent(backend, &prompt, model, bod_dir, true, false, repo_root, bod_dir)
         .await
         .map_err(|e| {
             if backend::is_arg_too_long(&e) {

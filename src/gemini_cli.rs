@@ -10,11 +10,22 @@ use tokio::process::Command;
 /// Gemini CLI does not expose the same git-specific deny-list flags that the
 /// Copilot and Claude CLIs do, so this integration leans on Gemini's sandbox
 /// mode plus prompt-level restrictions. Treat agent output as untrusted.
-pub fn command(model: &str, repo_root: &Path, state_dir: &Path) -> Command {
+pub fn command(
+    model: &str,
+    working_dir: &Path,
+    allow_repo_access: bool,
+    use_sandbox: bool,
+    repo_root: &Path,
+    state_dir: &Path,
+) -> std::io::Result<Command> {
     let mut command = Command::new("gemini");
     command.env("GIT_CONFIG_GLOBAL", crate::backend::NULL_DEVICE);
     command.env("GIT_CONFIG_SYSTEM", crate::backend::NULL_DEVICE);
-    command.current_dir(repo_root);
+    crate::backend::apply_node_heap_limit(&mut command);
+    // Sanitize environment when repository access is not allowed to reduce
+    // risk of deny-list bypass via child processes (unset git envs, use curated PATH).
+    crate::backend::sanitize_command_env(&mut command, allow_repo_access, "gemini")?;
+    command.current_dir(working_dir);
     command
         .arg("--model")
         .arg(model)
@@ -22,20 +33,23 @@ pub fn command(model: &str, repo_root: &Path, state_dir: &Path) -> Command {
         .arg("")
         .arg("--approval-mode")
         .arg("yolo")
-        .arg("--sandbox")
-        .arg("--include-directories")
-        .arg(repo_root)
         .arg("--include-directories")
         .arg(state_dir)
         .arg("--output-format")
         .arg("text");
-    command
+    if use_sandbox {
+        command.arg("--sandbox");
+    }
+    if allow_repo_access {
+        command.arg("--include-directories").arg(repo_root);
+    }
+    Ok(command)
 }
 
 pub fn print_permissions_warning() {
     eprintln!("Warning: Gemini CLI backend runs with --approval-mode yolo.");
     eprintln!("  Tool actions are auto-approved for non-interactive execution.");
-    eprintln!("  bod also enables Gemini sandboxing, but Gemini CLI does not expose");
+    eprintln!("  bod can enable Gemini sandboxing for fixer runs, but Gemini CLI does not expose");
     eprintln!("  the same git-specific deny-list controls as Copilot or Claude.");
     eprintln!("  Review agent output carefully, especially for fix runs.");
 }

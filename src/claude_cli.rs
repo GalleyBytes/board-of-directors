@@ -20,24 +20,35 @@ use tokio::process::Command;
 /// - Non-git destructive commands (`rm`, `curl | sh`) are NOT blocked.
 /// - The `--dangerously-skip-permissions` flag is required for non-interactive
 ///   operation but grants broad shell access. Treat agent output as untrusted.
-pub fn command(model: &str, repo_root: &Path, state_dir: &Path) -> Command {
+pub fn command(
+    model: &str,
+    working_dir: &Path,
+    allow_repo_access: bool,
+    repo_root: &Path,
+    state_dir: &Path,
+) -> std::io::Result<Command> {
     let mut command = Command::new("claude");
     // Defense-in-depth: override git config paths to prevent the agent from
     // reading user aliases or writing persistent config via indirect invocation.
     command.env("GIT_CONFIG_GLOBAL", crate::backend::NULL_DEVICE);
     command.env("GIT_CONFIG_SYSTEM", crate::backend::NULL_DEVICE);
-    command.current_dir(repo_root);
+    // Apply Node heap limit to avoid OOMs on large inputs (same as other backends).
+    crate::backend::apply_node_heap_limit(&mut command);
+    // Sanitize environment for runs that should not access the repository.
+    crate::backend::sanitize_command_env(&mut command, allow_repo_access, "claude")?;
+    command.current_dir(working_dir);
     command
         .arg("--print")
         .arg("--model")
         .arg(model)
         .arg("--add-dir")
-        .arg(repo_root)
-        .arg("--add-dir")
         .arg(state_dir)
         .arg("--disallowed-tools=Bash(git:*)")
         .arg("--dangerously-skip-permissions");
-    command
+    if allow_repo_access {
+        command.arg("--add-dir").arg(repo_root);
+    }
+    Ok(command)
 }
 
 /// Print a warning about the --dangerously-skip-permissions flag.
