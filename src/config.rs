@@ -71,18 +71,18 @@ impl Default for ReviewConfig {
             models: vec![
                 ModelEntry {
                     codename: "opus".to_string(),
-                    backend: Backend::Copilot,
-                    model: "claude-opus-4.6".to_string(),
+                    backend: Backend::ClaudeCode,
+                    model: "claude-opus-4-6".to_string(),
                 },
                 ModelEntry {
                     codename: "gemini".to_string(),
-                    backend: Backend::Copilot,
+                    backend: Backend::GeminiCli,
                     model: "gemini-3-pro-preview".to_string(),
                 },
                 ModelEntry {
                     codename: "codex".to_string(),
                     backend: Backend::Copilot,
-                    model: "gpt-5.3-codex".to_string(),
+                    model: "gpt-4o".to_string(),
                 },
             ],
         }
@@ -92,8 +92,8 @@ impl Default for ReviewConfig {
 impl Default for ConsolidateConfig {
     fn default() -> Self {
         Self {
-            backend: Backend::Copilot,
-            model: "claude-opus-4.6".to_string(),
+            backend: Backend::ClaudeCode,
+            model: "claude-sonnet-4-6".to_string(),
         }
     }
 }
@@ -102,7 +102,7 @@ impl Default for BugfixConfig {
     fn default() -> Self {
         Self {
             backend: Backend::Copilot,
-            model: "gpt-5.3-codex".to_string(),
+            model: "gpt-4o".to_string(),
         }
     }
 }

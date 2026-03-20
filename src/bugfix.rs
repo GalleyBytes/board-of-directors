@@ -251,9 +251,9 @@ pub async fn run(
                         ts
                     }
                     None => {
-                        let message = terminal_step_failure("Review step failed", e.to_string());
-                        session.mark_error(message.clone()).await;
-                        return Err(message);
+                        eprintln!("  Review step failed completely. Retrying in next iteration.");
+                        session.set_message(format!("Review step failed: {}", e)).await;
+                        continue;
                     }
                 }
             }
@@ -322,13 +322,11 @@ pub async fn run(
                 report
             }
             StepOutcome::Completed(Err(e)) => {
-                eprintln!("  Consolidation failed: {}", e);
+                eprintln!("  Consolidation failed: {}. Retrying in next iteration.", e);
                 session
                     .fail_consolidation(&consolidate_label, e.to_string())
                     .await;
-                let message = terminal_step_failure("Consolidation failed", e);
-                session.mark_error(message.clone()).await;
-                return Err(message);
+                continue;
             }
             StepOutcome::Cancelled => {
                 session
@@ -448,9 +446,8 @@ pub async fn run(
                     return Err(message);
                 }
                 session.fail_fix(&bugfix_label, e.to_string()).await;
-                let message = terminal_step_failure("Fix step failed", e);
-                session.mark_error(message.clone()).await;
-                return Err(message);
+                eprintln!("  Fix step failed: {}. Retrying in next iteration.", e);
+                continue;
             }
             FixAgentOutcome::Cancelled => {
                 if let Err(e) = restore_fix_step_state(
@@ -509,10 +506,6 @@ pub async fn run(
         final_snapshot.last_error.as_deref(),
         &final_snapshot.latest_message,
     )
-}
-
-fn terminal_step_failure(prefix: &str, detail: impl Into<String>) -> String {
-    format!("{prefix}: {}", detail.into())
 }
 
 fn final_result_from_status(
@@ -740,7 +733,7 @@ For each fix, write:
         &prompt,
         fix_model,
         repo_root,
-        true,
+        false,
         true,
         repo_root,
         state_dir,

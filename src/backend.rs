@@ -163,6 +163,10 @@ async fn run_agent_inner_with_cancel(
                 RATE_LIMIT_MAX_RETRIES, backend, model
             );
             eprintln!("{}", msg);
+            // Intentional immediate error return: propagating rate-limit exhaustion
+            // as an Err aborts the current run rather than returning a 'Completed'
+            // state with partial/failed agent output. This prevents cascading failures
+            // where subsequent steps try to parse rate-limit HTML/JSON as code or reviews.
             return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
         }
 
@@ -229,7 +233,7 @@ async fn run_agent_once_with_cancel(
                 allow_repo_access,
                 repo_root,
                 state_dir,
-            )?;
+            ).await?;
             spawn_command(cmd, None)?
         }
         Backend::ClaudeCode => {
@@ -239,7 +243,7 @@ async fn run_agent_once_with_cancel(
                 allow_repo_access,
                 repo_root,
                 state_dir,
-            )?;
+            ).await?;
             spawn_command(cmd, Some(prompt.as_bytes().to_vec()))?
         }
         Backend::GeminiCli => {
@@ -250,7 +254,7 @@ async fn run_agent_once_with_cancel(
                 use_sandbox,
                 repo_root,
                 state_dir,
-            )?;
+            ).await?;
             spawn_command(cmd, Some(prompt.as_bytes().to_vec()))?
         }
     };
@@ -572,9 +576,8 @@ fn merge_node_options(existing: Option<&str>, heap_limit_mb: &str) -> String {
 ///   per-run and ensures predictable PATH contents.
 /// - If no allowed binaries (including the program itself) can be located,
 ///   an error is returned.
-pub fn sanitize_command_env(cmd: &mut tokio::process::Command, allow_repo_access: bool, program_name: &str) -> std::io::Result<()> {
+pub async fn sanitize_command_env(cmd: &mut tokio::process::Command, allow_repo_access: bool, program_name: &str) -> std::io::Result<()> {
     use std::io;
-    use std::fs::OpenOptions;
     use fs2::FileExt;
     if allow_repo_access {
         return Ok(());
@@ -602,7 +605,7 @@ pub fn sanitize_command_env(cmd: &mut tokio::process::Command, allow_repo_access
     // enables shell-driven bypasses such as `sh -c "/usr/bin/git ..."` which
     // would defeat PATH-only sanitization. Absolute-path programs are refused
     // below.
-    let mut allowed_bins = vec!["printf", "sleep", "cat", "sed", "awk", "grep", "xargs", "node", "python3", "python"];
+    let mut allowed_bins = vec!["printf", "sleep", "cat", "sed", "awk", "grep", "xargs"];
     if !allowed_bins.contains(&program_name) {
         allowed_bins.push(program_name);
     }
@@ -691,7 +694,7 @@ pub fn sanitize_command_env(cmd: &mut tokio::process::Command, allow_repo_access
     } else if let Ok(home) = std::env::var("HOME") {
         std::path::PathBuf::from(home).join(".config").join("board-of-directors").join("safe-bin")
     } else {
-        std::env::temp_dir().join("bod-safe-bin-global")
+        std::env::temp_dir().join(format!("bod-safe-bin-{}", std::process::id()))
     };
 
     // Populate the safe-dir while avoiding blocking Tokio worker threads.
@@ -790,37 +793,20 @@ pub fn sanitize_command_env(cmd: &mut tokio::process::Command, allow_repo_access
     let sources_clone = sources.clone();
 
     // Run population off the current thread to avoid panics on current-thread Tokio runtimes.
-    // Use a dedicated std thread so this function remains synchronous while avoiding blocking
-    // Tokio worker threads. If spawning the thread fails, fall back to inline population.
+    // Use tokio::task::spawn_blocking to avoid blocking Tokio worker threads.
     if tokio::runtime::Handle::try_current().is_ok() {
-        let safe_dir_for_thread = safe_dir_clone.clone();
-        let sources_for_thread = sources_clone.clone();
-        let handle = std::thread::Builder::new()
-            .name("bod-safe-bin-populate".to_string())
-            .spawn(move || populate_inner(&safe_dir_for_thread, &sources_for_thread));
-        match handle {
-            Ok(join_handle) => {
-                match join_handle.join() {
-                    Ok(res) => res?,
-                    Err(join_err) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("sanitize_command_env: populate thread panicked: {:?}", join_err),
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("sanitize_command_env: failed to spawn populate thread: {}; falling back to inline populate", e);
-                populate_inner(&safe_dir_clone, &sources_clone)?;
-            }
-        }
+        let res = tokio::task::spawn_blocking(move || {
+            populate_inner(&safe_dir_clone, &sources_clone)
+        }).await.unwrap_or_else(|e| {
+            Err(io::Error::new(io::ErrorKind::Other, format!("spawn_blocking failed: {}", e)))
+        });
+        res?;
     } else {
         populate_inner(&safe_dir, &sources)?;
     }
 
     // Final check: ensure the program binary (or its shim) exists in safe_dir.
-    let mut prog_path = safe_dir_clone.join(program_name);
+    let mut prog_path = safe_dir.join(program_name);
     if cfg!(windows) {
         if !prog_path.exists() {
             // Check PATHEXT-aware variants, including .bat created shims.
@@ -828,14 +814,14 @@ pub fn sanitize_command_env(cmd: &mut tokio::process::Command, allow_repo_access
             for ext in pathext.split(';').filter_map(|s| {
                 let s = s.trim(); if s.is_empty() { None } else { Some(s) }
             }) {
-                let candidate = safe_dir_clone.join(format!("{}{}", program_name, ext));
+                let candidate = safe_dir.join(format!("{}{}", program_name, ext));
                 if candidate.exists() {
                     prog_path = candidate;
                     break;
                 }
             }
             // Also check .bat shim
-            let bat = safe_dir_clone.join(program_name).with_extension("bat");
+            let bat = safe_dir.join(program_name).with_extension("bat");
             if prog_path.as_path().exists() == false && bat.exists() {
                 prog_path = bat;
             }
@@ -857,7 +843,7 @@ pub fn sanitize_command_env(cmd: &mut tokio::process::Command, allow_repo_access
     // OS-level sandboxing (containers, seccomp, mount namespaces) for stronger isolation.
     eprintln!("sanitize_command_env: WARNING: PATH-based sanitization is not a full sandbox. Child processes may still exec absolute-path binaries and bypass PATH shims. Use OS-level sandboxing (containers, seccomp, namespaces) or run agents in restricted environments for stronger isolation.");
     // Set PATH to the single safe-dir.
-    cmd.env("PATH", safe_dir_clone.to_str().unwrap_or_default());
+    cmd.env("PATH", safe_dir.to_str().unwrap_or_default());
     Ok(())
 }
 

@@ -455,7 +455,7 @@ Here is the diff to review:
         &prompt,
         model_id,
         state_dir,
-        true,
+        false,
         false,
         repo_root,
         state_dir,

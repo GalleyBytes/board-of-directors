@@ -412,7 +412,7 @@ Here are the individual reviews:
 {reviews_content}"#
     );
 
-    let output = backend::run_agent(backend, &prompt, model, bod_dir, true, false, repo_root, bod_dir)
+    let output = backend::run_agent(backend, &prompt, model, bod_dir, false, false, repo_root, bod_dir)
         .await
         .map_err(|e| {
             if backend::is_arg_too_long(&e) {

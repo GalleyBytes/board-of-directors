@@ -20,7 +20,7 @@ use tokio::process::Command;
 /// - Non-git destructive commands (`rm`, `curl | sh`) are NOT blocked.
 /// - The `--dangerously-skip-permissions` flag is required for non-interactive
 ///   operation but grants broad shell access. Treat agent output as untrusted.
-pub fn command(
+pub async fn command(
     model: &str,
     working_dir: &Path,
     allow_repo_access: bool,
@@ -35,7 +35,7 @@ pub fn command(
     // Apply Node heap limit to avoid OOMs on large inputs (same as other backends).
     crate::backend::apply_node_heap_limit(&mut command);
     // Sanitize environment for runs that should not access the repository.
-    crate::backend::sanitize_command_env(&mut command, allow_repo_access, "claude")?;
+    crate::backend::sanitize_command_env(&mut command, allow_repo_access, "claude").await?;
     command.current_dir(working_dir);
     command
         .arg("--print")

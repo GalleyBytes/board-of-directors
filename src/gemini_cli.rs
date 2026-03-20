@@ -3,14 +3,13 @@ use tokio::process::Command;
 
 /// Build a Gemini CLI command.
 ///
-/// The prompt is delivered via stdin and `--prompt ""` forces Gemini into
-/// headless mode, so repository content is not exposed in `ps` output and
-/// large prompts do not rely on OS argument-size limits.
+/// The prompt is delivered via the `--prompt` argument. Note that large prompts
+/// might exceed OS argument-size limits and will be visible in `ps` output.
 ///
 /// Gemini CLI does not expose the same git-specific deny-list flags that the
 /// Copilot and Claude CLIs do, so this integration leans on Gemini's sandbox
 /// mode plus prompt-level restrictions. Treat agent output as untrusted.
-pub fn command(
+pub async fn command(
     model: &str,
     working_dir: &Path,
     allow_repo_access: bool,
@@ -24,13 +23,11 @@ pub fn command(
     crate::backend::apply_node_heap_limit(&mut command);
     // Sanitize environment when repository access is not allowed to reduce
     // risk of deny-list bypass via child processes (unset git envs, use curated PATH).
-    crate::backend::sanitize_command_env(&mut command, allow_repo_access, "gemini")?;
+    crate::backend::sanitize_command_env(&mut command, allow_repo_access, "gemini").await?;
     command.current_dir(working_dir);
     command
         .arg("--model")
         .arg(model)
-        .arg("--prompt")
-        .arg("")
         .arg("--approval-mode")
         .arg("yolo")
         .arg("--include-directories")

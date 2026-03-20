@@ -2,7 +2,7 @@ use crate::backend::DENIED_GIT_SUBCOMMANDS;
 use std::path::Path;
 use tokio::process::Command;
 
-pub fn command(
+pub async fn command(
     prompt: &str,
     model: &str,
     working_dir: &Path,
@@ -17,7 +17,7 @@ pub fn command(
     command.env("GIT_CONFIG_SYSTEM", crate::backend::NULL_DEVICE);
     crate::backend::apply_node_heap_limit(&mut command);
     // Sanitize environment for runs that should not access the repository.
-    crate::backend::sanitize_command_env(&mut command, allow_repo_access, "copilot")?;
+    crate::backend::sanitize_command_env(&mut command, allow_repo_access, "copilot").await?;
     command.current_dir(working_dir);
     command
         .arg("-p")
