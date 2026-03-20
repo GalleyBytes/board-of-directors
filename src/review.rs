@@ -4,7 +4,9 @@ use crate::bugfix_session::BugfixSession;
 use crate::config::{Backend, Config};
 use crate::files;
 use crate::git;
+use std::fs::OpenOptions;
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -68,6 +70,16 @@ struct ReviewAgentRequest {
     use_sandbox: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewContextArtifacts {
+    default_branch: String,
+    full_diff_path: PathBuf,
+    diff_stat_path: PathBuf,
+    changed_files_path: PathBuf,
+    changed_file_count: usize,
+    diff_bytes: usize,
+}
+
 pub async fn run(config: &Config) -> Result<String, ReviewError> {
     let repo_root = git::repo_root().map_err(ReviewError::fatal)?;
     let state_dir = files::ensure_state_dir(&repo_root).map_err(ReviewError::fatal)?;
@@ -87,28 +99,6 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
         "Reviewing branch '{}' against '{}'...",
         branch, default_branch
     );
-
-    let diff = git::generate_diff(&default_branch).map_err(ReviewError::fatal)?;
-
-    // Truncate diff if extremely large to avoid overwhelming agents
-    let max_diff_len = 100_000;
-    let truncated_diff: String;
-    let diff_for_prompt = if diff.len() > max_diff_len {
-        println!(
-            "Warning: diff is large ({} bytes), truncating to {} bytes for review.",
-            diff.len(),
-            max_diff_len
-        );
-        truncated_diff = format!(
-            "{}\n\n... [diff truncated at {} bytes; original size {} bytes] ...",
-            &diff[..diff.floor_char_boundary(max_diff_len)],
-            max_diff_len,
-            diff.len()
-        );
-        truncated_diff.as_str()
-    } else {
-        &diff
-    };
 
     // Reserve all output files first (before spawning any tasks) so that a
     // file-creation failure doesn't leave already-spawned tasks running as
@@ -136,13 +126,20 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
         ));
     }
 
+    let review_context =
+        generate_review_context_artifacts(&state_dir, &sanitized, &timestamp, &default_branch)?;
+    println!(
+        "  Review context prepared: {} changed file(s), {} bytes of diff.",
+        review_context.changed_file_count, review_context.diff_bytes
+    );
+
     let start_delays = reviewer_start_delays(reserved.len());
     let mut handles = Vec::new();
 
     for ((filename, output_path, guard, agent_backend, model_id, codename), start_delay) in
         reserved.into_iter().zip(start_delays.into_iter())
     {
-        let diff_text = diff_for_prompt.to_string();
+        let review_context = review_context.clone();
         let repo_root = repo_root.clone();
         let state_dir = state_dir.clone();
         if !start_delay.is_zero() {
@@ -163,7 +160,7 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
                 &state_dir,
                 &codename,
                 &model_id,
-                &diff_text,
+                &review_context,
                 &output_path,
                 guard,
             )
@@ -256,27 +253,6 @@ pub async fn run_for_bugfix(
         .begin_review(config.review.models.len() as u32)
         .await;
 
-    let diff = git::generate_diff(&default_branch).map_err(ReviewError::fatal)?;
-
-    let max_diff_len = 100_000;
-    let truncated_diff: String;
-    let diff_for_prompt = if diff.len() > max_diff_len {
-        println!(
-            "Warning: diff is large ({} bytes), truncating to {} bytes for review.",
-            diff.len(),
-            max_diff_len
-        );
-        truncated_diff = format!(
-            "{}\n\n... [diff truncated at {} bytes; original size {} bytes] ...",
-            &diff[..diff.floor_char_boundary(max_diff_len)],
-            max_diff_len,
-            diff.len()
-        );
-        truncated_diff.as_str()
-    } else {
-        &diff
-    };
-
     let mut reserved: Vec<(
         String,
         PathBuf,
@@ -300,12 +276,19 @@ pub async fn run_for_bugfix(
         ));
     }
 
+    let review_context =
+        generate_review_context_artifacts(&state_dir, &sanitized, &timestamp, &default_branch)?;
+    println!(
+        "  Review context prepared: {} changed file(s), {} bytes of diff.",
+        review_context.changed_file_count, review_context.diff_bytes
+    );
+
     let mut join_set = tokio::task::JoinSet::new();
     let start_delays = reviewer_start_delays(reserved.len());
     for ((filename, output_path, guard, agent_backend, model_id, codename), start_delay) in
         reserved.into_iter().zip(start_delays.into_iter())
     {
-        let diff_text = diff_for_prompt.to_string();
+        let review_context = review_context.clone();
         let repo_root = repo_root.clone();
         let state_dir = state_dir.clone();
         if !start_delay.is_zero() {
@@ -328,7 +311,7 @@ pub async fn run_for_bugfix(
                     &state_dir,
                     &codename,
                     &model_id,
-                    &diff_text,
+                    &review_context,
                     &output_path,
                     guard,
                 )
@@ -419,17 +402,113 @@ pub async fn run_for_bugfix(
     }
 }
 
+fn generate_review_context_artifacts(
+    state_dir: &Path,
+    sanitized_branch: &str,
+    timestamp: &str,
+    default_branch: &str,
+) -> Result<ReviewContextArtifacts, ReviewError> {
+    let diff = git::generate_diff(default_branch).map_err(ReviewError::fatal)?;
+    let diff_stat = git::generate_diff_stat(default_branch).map_err(ReviewError::fatal)?;
+    let changed_files = git::generate_changed_files(default_branch).map_err(ReviewError::fatal)?;
+
+    write_review_context_artifacts(
+        state_dir,
+        sanitized_branch,
+        timestamp,
+        default_branch,
+        &diff,
+        &diff_stat,
+        &changed_files,
+    )
+}
+
+fn write_review_context_artifacts(
+    state_dir: &Path,
+    sanitized_branch: &str,
+    timestamp: &str,
+    default_branch: &str,
+    diff: &str,
+    diff_stat: &str,
+    changed_files: &[String],
+) -> Result<ReviewContextArtifacts, ReviewError> {
+    let (full_diff_path, diff_stat_path, changed_files_path) =
+        build_review_context_paths(state_dir, sanitized_branch, timestamp);
+    let changed_files_text = if changed_files.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", changed_files.join("\n"))
+    };
+    let mut created = Vec::new();
+
+    if let Err(error) = write_text_artifact(&full_diff_path, diff) {
+        return Err(ReviewError::fatal(error));
+    }
+    created.push(full_diff_path.clone());
+
+    if let Err(error) = write_text_artifact(&diff_stat_path, diff_stat) {
+        cleanup_created_artifacts(&created);
+        return Err(ReviewError::fatal(error));
+    }
+    created.push(diff_stat_path.clone());
+
+    if let Err(error) = write_text_artifact(&changed_files_path, &changed_files_text) {
+        cleanup_created_artifacts(&created);
+        return Err(ReviewError::fatal(error));
+    }
+
+    Ok(ReviewContextArtifacts {
+        default_branch: default_branch.to_string(),
+        full_diff_path,
+        diff_stat_path,
+        changed_files_path,
+        changed_file_count: changed_files.len(),
+        diff_bytes: diff.len(),
+    })
+}
+
+fn build_review_context_paths(
+    state_dir: &Path,
+    sanitized_branch: &str,
+    timestamp: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        state_dir.join(format!("{}-diff-{}.patch", timestamp, sanitized_branch)),
+        state_dir.join(format!("{}-diffstat-{}.txt", timestamp, sanitized_branch)),
+        state_dir.join(format!("{}-files-{}.txt", timestamp, sanitized_branch)),
+    )
+}
+
+fn write_text_artifact(path: &Path, contents: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("Failed to create {}: {}", path.display(), e))?;
+    if let Err(e) = file.write_all(contents.as_bytes()) {
+        let _ = std::fs::remove_file(path);
+        return Err(format!("Failed to write {}: {}", path.display(), e));
+    }
+    Ok(())
+}
+
+fn cleanup_created_artifacts(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 async fn run_agent_review(
     backend: &Backend,
     repo_root: &Path,
     state_dir: &Path,
     codename: &str,
     model_id: &str,
-    diff: &str,
+    review_context: &ReviewContextArtifacts,
     output_path: &PathBuf,
     mut guard: agents::ReservedFile,
 ) -> Result<(), ReviewError> {
-    let request = build_review_agent_request(repo_root, state_dir, output_path, diff);
+    let request = build_review_agent_request(repo_root, state_dir, output_path, review_context);
 
     let output = backend::run_agent(
         backend,
@@ -446,8 +525,7 @@ async fn run_agent_review(
         if backend::is_arg_too_long(&e) {
             ReviewError::fatal(
                 "Prompt exceeds OS argument-size limit (E2BIG). \
-                 The diff may be too large for command-line passing. \
-                 Consider reviewing a smaller changeset.",
+                 Consider checking prompt construction or backend CLI limits.",
             )
         } else {
             ReviewError::retryable(format!("{} failed to start agent: {}", codename, e))
@@ -512,13 +590,16 @@ fn build_review_agent_request(
     repo_root: &Path,
     state_dir: &Path,
     output_path: &Path,
-    diff: &str,
+    review_context: &ReviewContextArtifacts,
 ) -> ReviewAgentRequest {
     let output_path_str = output_path.to_string_lossy().to_string();
     let repo_root_str = repo_root.to_string_lossy().to_string();
+    let full_diff_path_str = review_context.full_diff_path.to_string_lossy().to_string();
+    let diff_stat_path_str = review_context.diff_stat_path.to_string_lossy().to_string();
+    let changed_files_path_str = review_context.changed_files_path.to_string_lossy().to_string();
 
     let prompt = format!(
-        r#"You are a senior code reviewer. Review the following git diff for a pull request.
+        r#"You are a senior code reviewer. Review the current git branch against `origin/{default_branch}`.
 
 Your task:
 - Identify critical bugs, logic errors, security vulnerabilities, and correctness issues.
@@ -533,14 +614,23 @@ Your task:
 - Do NOT inspect, reference, or use that tooling state as evidence about repository correctness.
 - Do NOT reference other reviewers or reviews.
 - The only allowed interaction with tooling state is writing the review file requested below.
+- The full diff file below is the source of truth for the entire change set. Review the full scope of changes, not just a subset.
+
+Review context files in tooling state:
+- Full diff: {full_diff_path_str}
+- Diff stat: {diff_stat_path_str}
+- Changed files: {changed_files_path_str}
+
+Quick context:
+- Changed files: {changed_file_count}
+- Full diff size: {diff_bytes} bytes
 
 Write your complete review to the file: {output_path_str}
 
-Here is the diff to review:
-
-```diff
-{diff}
-```"#
+Use the diff/context files above plus any read-only repo inspection you need to produce the review."#,
+        default_branch = review_context.default_branch,
+        changed_file_count = review_context.changed_file_count,
+        diff_bytes = review_context.diff_bytes
     );
 
     ReviewAgentRequest {
@@ -604,11 +694,19 @@ mod tests {
 
     #[test]
     fn review_agent_request_uses_state_dir_with_repo_read_access() {
+        let review_context = ReviewContextArtifacts {
+            default_branch: "main".to_string(),
+            full_diff_path: PathBuf::from("/state/20260320120000-diff-feature.patch"),
+            diff_stat_path: PathBuf::from("/state/20260320120000-diffstat-feature.txt"),
+            changed_files_path: PathBuf::from("/state/20260320120000-files-feature.txt"),
+            changed_file_count: 2,
+            diff_bytes: 1234,
+        };
         let request = build_review_agent_request(
             Path::new("/repo"),
             Path::new("/state"),
             Path::new("/state/review.md"),
-            "diff body",
+            &review_context,
         );
 
         assert_eq!(request.working_dir, PathBuf::from("/state"));
@@ -617,6 +715,55 @@ mod tests {
         assert!(request.prompt.contains("git -C /repo"));
         assert!(request
             .prompt
+            .contains("/state/20260320120000-diff-feature.patch"));
+        assert!(request
+            .prompt
             .contains("Do NOT edit repository files, create files in the repository"));
+    }
+
+    #[test]
+    fn build_review_context_paths_are_round_scoped() {
+        let (full_diff, diff_stat, changed_files) =
+            build_review_context_paths(Path::new("/state"), "feature", "20260320120000nabcdef");
+
+        assert_eq!(
+            full_diff,
+            PathBuf::from("/state/20260320120000nabcdef-diff-feature.patch")
+        );
+        assert_eq!(
+            diff_stat,
+            PathBuf::from("/state/20260320120000nabcdef-diffstat-feature.txt")
+        );
+        assert_eq!(
+            changed_files,
+            PathBuf::from("/state/20260320120000nabcdef-files-feature.txt")
+        );
+    }
+
+    #[test]
+    fn write_review_context_artifacts_writes_expected_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let changed_files = vec!["src/main.rs".to_string(), "src/review.rs".to_string()];
+
+        let context = write_review_context_artifacts(
+            dir.path(),
+            "feature",
+            "20260320120000nabcdef",
+            "main",
+            "diff body",
+            "diff stat",
+            &changed_files,
+        )
+        .unwrap();
+
+        assert_eq!(context.default_branch, "main");
+        assert_eq!(context.changed_file_count, 2);
+        assert_eq!(context.diff_bytes, "diff body".len());
+        assert_eq!(std::fs::read_to_string(&context.full_diff_path).unwrap(), "diff body");
+        assert_eq!(std::fs::read_to_string(&context.diff_stat_path).unwrap(), "diff stat");
+        assert_eq!(
+            std::fs::read_to_string(&context.changed_files_path).unwrap(),
+            "src/main.rs\nsrc/review.rs\n"
+        );
     }
 }

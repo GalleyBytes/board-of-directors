@@ -221,7 +221,7 @@ pub fn create_consolidated_file(
     Ok((filename, guard))
 }
 
-/// Remove review files older than the most recent `keep` rounds.
+/// Remove review round artifacts older than the most recent `keep` rounds.
 /// Never removes bugfix logs or consolidated reports.
 ///
 /// Consolidated reports are preserved because they are the useful synthesis output;
@@ -236,26 +236,33 @@ pub fn cleanup_old_rounds(
     bod_dir: &Path,
     keep: usize,
 ) -> Result<u32, String> {
-    // Collect all timestamped review .md files, excluding consolidated reports and bugfix logs.
-    // Consolidated reports share the same round prefix as their source reviews but should
-    // be preserved -- they are the useful synthesis output.
+    // Collect all timestamped review round artifacts, excluding consolidated reports,
+    // bugfix logs, and unrelated user files. Consolidated reports share the same round
+    // prefix as their source reviews but should be preserved -- they are the useful
+    // synthesis output.
     let mut files_with_ts: Vec<(String, String)> = Vec::new();
 
     let entries = std::fs::read_dir(bod_dir)
         .map_err(|e| format!("Failed to read directory {}: {}", bod_dir.display(), e))?;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".md") && !files::is_bugfix_log(&name) && !is_consolidated_file(&name) {
-            let stem = name.strip_suffix(".md").unwrap_or(&name);
-            if let Some((round_id, rest)) = split_round_prefix(stem) {
-                // Only collect files matching the review naming structure
-                // ({round_id}-{codename}-{branch}[~N].md). This prevents
-                // user-created files like `20260316153045-notes.md` from
-                // being silently deleted.
-                if is_review_file_structure(rest) {
-                    files_with_ts.push((round_id.to_string(), name));
-                }
-            }
+        if files::is_bugfix_log(&name) {
+            continue;
+        }
+        let path = Path::new(&name);
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if extension == "md" && is_consolidated_file(&name) {
+            continue;
+        }
+        if let Some((round_id, rest)) = split_round_prefix(stem)
+            && is_cleanup_candidate(rest, extension)
+        {
+            files_with_ts.push((round_id.to_string(), name));
         }
     }
 
@@ -298,7 +305,7 @@ pub fn cleanup_old_rounds(
     }
 
     if removed > 0 {
-        eprintln!("  Cleaned up {} old review file(s).", removed);
+        eprintln!("  Cleaned up {} old review artifact(s).", removed);
     }
 
     Ok(removed)
@@ -457,6 +464,28 @@ fn is_review_file_structure(rest: &str) -> bool {
     };
     // Base (codename-branch) must be non-empty and only contain valid chars
     !base.is_empty() && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn is_cleanup_candidate(rest: &str, extension: &str) -> bool {
+    match extension {
+        "md" => is_review_file_structure(rest),
+        "patch" => is_review_context_artifact(rest, "diff-"),
+        "txt" => {
+            is_review_context_artifact(rest, "diffstat-")
+                || is_review_context_artifact(rest, "files-")
+        }
+        _ => false,
+    }
+}
+
+fn is_review_context_artifact(rest: &str, prefix: &str) -> bool {
+    let Some(branch_part) = rest.strip_prefix(prefix) else {
+        return false;
+    };
+    !branch_part.is_empty()
+        && branch_part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Check if a filename is a consolidated report. Matches both new-format
@@ -1357,6 +1386,42 @@ mod tests {
         // User-created timestamped files are preserved
         assert!(dir.path().join("20260316153045-notes.md").exists());
         assert!(dir.path().join("20260316153045-scratch.md").exists());
+    }
+
+    #[test]
+    fn cleanup_old_rounds_removes_large_diff_artifacts_with_old_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("20260316153045n000000000001-opus-feature.md"), "").unwrap();
+        fs::write(dir.path().join("20260316153045n000000000001-diff-feature.patch"), "").unwrap();
+        fs::write(dir.path().join("20260316153045n000000000001-diffstat-feature.txt"), "").unwrap();
+        fs::write(dir.path().join("20260316153045n000000000001-files-feature.txt"), "").unwrap();
+        fs::write(dir.path().join("20260316200015n000000000002-opus-feature.md"), "").unwrap();
+        fs::write(dir.path().join("20260316200015n000000000002-diff-feature.patch"), "").unwrap();
+
+        let removed = cleanup_old_rounds(dir.path(), 1).unwrap();
+        assert_eq!(removed, 4);
+        assert!(!dir.path().join("20260316153045n000000000001-opus-feature.md").exists());
+        assert!(!dir.path().join("20260316153045n000000000001-diff-feature.patch").exists());
+        assert!(!dir.path().join("20260316153045n000000000001-diffstat-feature.txt").exists());
+        assert!(!dir.path().join("20260316153045n000000000001-files-feature.txt").exists());
+        assert!(dir.path().join("20260316200015n000000000002-opus-feature.md").exists());
+        assert!(dir.path().join("20260316200015n000000000002-diff-feature.patch").exists());
+    }
+
+    #[test]
+    fn cleanup_old_rounds_preserves_user_timestamped_txt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
+        fs::write(dir.path().join("20260316200015-opus-feature.md"), "").unwrap();
+        fs::write(dir.path().join("20260316153045-notes.txt"), "notes").unwrap();
+        fs::write(dir.path().join("20260316153045-summary.txt"), "summary").unwrap();
+
+        let removed = cleanup_old_rounds(dir.path(), 1).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!dir.path().join("20260316153045-opus-feature.md").exists());
+        assert!(dir.path().join("20260316200015-opus-feature.md").exists());
+        assert!(dir.path().join("20260316153045-notes.txt").exists());
+        assert!(dir.path().join("20260316153045-summary.txt").exists());
     }
 
     #[test]

@@ -44,10 +44,37 @@ pub fn current_branch() -> Result<String, String> {
 }
 
 pub fn generate_diff(default_branch: &str) -> Result<String, String> {
+    let diff = run_diff_command(default_branch, &[])?;
+    if diff.trim().is_empty() {
+        return Err("No diff found between current branch and default branch.".to_string());
+    }
+
+    Ok(diff)
+}
+
+pub fn generate_diff_stat(default_branch: &str) -> Result<String, String> {
+    run_diff_command(default_branch, &["--stat"])
+}
+
+pub fn generate_changed_files(default_branch: &str) -> Result<Vec<String>, String> {
+    let output = run_diff_command(default_branch, &["--name-only"])?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect())
+}
+
+fn run_diff_command(default_branch: &str, extra_args: &[&str]) -> Result<String, String> {
+    let mut args: Vec<String> = vec!["diff".to_string()];
+    args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
     // Use origin/main (two-dot) against working tree so uncommitted changes
     // (e.g. from the bugfix agent) are visible to reviewers.
+    args.push(format!("origin/{}", default_branch));
+
     let output = Command::new("git")
-        .args(["diff", &format!("origin/{}", default_branch)])
+        .args(args)
         .output()
         .map_err(|e| format!("Failed to run git diff: {}", e))?;
 
@@ -56,12 +83,7 @@ pub fn generate_diff(default_branch: &str) -> Result<String, String> {
         return Err(format!("git diff failed: {}", stderr));
     }
 
-    let diff = String::from_utf8_lossy(&output.stdout).to_string();
-    if diff.trim().is_empty() {
-        return Err("No diff found between current branch and default branch.".to_string());
-    }
-
-    Ok(diff)
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 pub fn repo_root() -> Result<std::path::PathBuf, String> {
