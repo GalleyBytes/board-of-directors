@@ -241,6 +241,10 @@ fn push_unique_backend(backends: &mut Vec<Backend>, backend: Backend) {
     }
 }
 
+pub fn codename_is_duplicate(codename: &str, existing: &[String]) -> bool {
+    existing.iter().any(|existing_codename| existing_codename == codename)
+}
+
 pub fn validate_models_for_backend(config: &Config) -> Result<(), String> {
     let mut unsafe_codenames = Vec::new();
     for entry in &config.review.models {
@@ -275,6 +279,24 @@ pub fn validate_models_for_backend(config: &Config) -> Result<(), String> {
         return Err(format!(
             "Reserved codename(s): {}. 'consolidated' conflicts with consolidated report filenames. Run 'bod init' to reconfigure.",
             reserved_codenames.join(", ")
+        ));
+    }
+
+    let mut seen_codenames = Vec::new();
+    let mut duplicate_codenames = Vec::new();
+    for entry in &config.review.models {
+        if codename_is_duplicate(&entry.codename, &seen_codenames) {
+            duplicate_codenames.push(entry.codename.clone());
+        } else {
+            seen_codenames.push(entry.codename.clone());
+        }
+    }
+    if !duplicate_codenames.is_empty() {
+        duplicate_codenames.sort();
+        duplicate_codenames.dedup();
+        return Err(format!(
+            "Duplicate codename(s): {}. Each reviewer must have a unique codename so dashboard files do not collide. Run 'bod init' to reconfigure.",
+            duplicate_codenames.join(", ")
         ));
     }
 
@@ -523,6 +545,31 @@ mod tests {
 
         let error = validate_models_for_backend(&config).unwrap_err();
         assert!(error.contains("Gemini CLI backend"));
+    }
+
+    #[test]
+    fn rejects_duplicate_review_codenames() {
+        let config = Config {
+            review: ReviewConfig {
+                models: vec![
+                    ModelEntry {
+                        codename: "alpha".to_string(),
+                        backend: Backend::Copilot,
+                        model: "gpt-5.3-codex".to_string(),
+                    },
+                    ModelEntry {
+                        codename: "alpha".to_string(),
+                        backend: Backend::GeminiCli,
+                        model: "flash".to_string(),
+                    },
+                ],
+            },
+            consolidate: ConsolidateConfig::default(),
+            bugfix: BugfixConfig::default(),
+        };
+
+        let error = validate_models_for_backend(&config).unwrap_err();
+        assert!(error.contains("Duplicate codename(s)"));
     }
 
     #[test]

@@ -166,7 +166,9 @@ pub async fn run(
     );
     println!("Dashboard: {} (port {})", server.url, server.port);
     if no_open {
-        println!("Automatic browser launch is disabled. Open the URL manually if you want the dashboard.");
+        println!(
+            "Automatic browser launch is disabled. Open the URL manually if you want the dashboard."
+        );
     } else {
         match web::open_browser(&server.url) {
             Ok(()) => println!("Opened the live dashboard in your browser."),
@@ -234,13 +236,23 @@ pub async fn run(
 
         if let Some(max) = max_iterations {
             if iteration >= max {
-                session
-                    .mark_completed(format!(
-                        "Iteration limit reached after {} iteration(s).",
-                        iteration
-                    ))
-                    .await;
-                println!("\n== Iteration limit ({}) reached. Stopping. ==", max);
+                let had_error = session.snapshot().await.last_error.is_some();
+                if !had_error {
+                    session
+                        .mark_completed(format!(
+                            "Iteration limit reached after {} iteration(s).",
+                            iteration
+                        ))
+                        .await;
+                }
+                if had_error {
+                    println!(
+                        "\n== Iteration limit ({}) reached after an error. Stopping. ==",
+                        max
+                    );
+                } else {
+                    println!("\n== Iteration limit ({}) reached. Stopping. ==", max);
+                }
                 break;
             }
         }
@@ -291,7 +303,8 @@ pub async fn run(
                     None => {
                         let message = terminal_step_failure("Review step failed", e.to_string());
                         session.mark_error(message.clone()).await;
-                        return Err(message);
+                        eprintln!("  {}", message);
+                        continue;
                     }
                 }
             }
@@ -366,7 +379,7 @@ pub async fn run(
                     .await;
                 let message = terminal_step_failure("Consolidation failed", e);
                 session.mark_error(message.clone()).await;
-                return Err(message);
+                continue;
             }
             StepOutcome::Cancelled => {
                 session
@@ -488,7 +501,7 @@ pub async fn run(
                 session.fail_fix(&bugfix_label, e.to_string()).await;
                 let message = terminal_step_failure("Fix step failed", e);
                 session.mark_error(message.clone()).await;
-                return Err(message);
+                continue;
             }
             FixAgentOutcome::Cancelled => {
                 if let Err(e) = restore_fix_step_state(
@@ -681,7 +694,11 @@ mod tests {
     #[test]
     fn final_result_returns_timeout_message_when_no_error_is_present() {
         assert_eq!(
-            final_result_from_status(SessionStatus::TimedOut, None, "Timeout reached after review step."),
+            final_result_from_status(
+                SessionStatus::TimedOut,
+                None,
+                "Timeout reached after review step."
+            ),
             Err("Timeout reached after review step.".to_string())
         );
     }
@@ -732,7 +749,9 @@ mod tests {
         assert!(summary.contains("Bugfix dry run only. No agents"));
         assert!(summary.contains("Browser auto-open: disabled"));
         assert!(summary.contains("working directory: /state"));
-        assert!(summary.contains("bugfix log appends must go directly to /state/bugfix-feature.log.md"));
+        assert!(
+            summary.contains("bugfix log appends must go directly to /state/bugfix-feature.log.md")
+        );
         assert!(summary.contains("dry-run mode does not append notes to the bugfix log"));
     }
 
@@ -754,9 +773,11 @@ mod tests {
         assert!(request.allow_repo_access);
         assert!(!request.use_sandbox);
         assert!(request.prompt.contains("git -C /repo"));
-        assert!(request
-            .prompt
-            .contains("Do NOT create temporary `.md` or `.txt` files in the repository."));
+        assert!(
+            request
+                .prompt
+                .contains("Do NOT create temporary `.md` or `.txt` files in the repository.")
+        );
         assert!(request.prompt.contains("/state/bugfix-feature.log.md"));
     }
 }

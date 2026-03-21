@@ -232,10 +232,7 @@ pub fn create_consolidated_file(
 /// files are not cleaned up because the `{codename}-{branch}` naming pattern is
 /// ambiguous with user-created files (e.g. `opus-my-notes.md`). Legacy files are
 /// finite and will not grow; users can remove them manually if needed.
-pub fn cleanup_old_rounds(
-    bod_dir: &Path,
-    keep: usize,
-) -> Result<u32, String> {
+pub fn cleanup_old_rounds(bod_dir: &Path, keep: usize) -> Result<u32, String> {
     // Collect all timestamped review round artifacts, excluding consolidated reports,
     // bugfix logs, and unrelated user files. Consolidated reports share the same round
     // prefix as their source reviews but should be preserved -- they are the useful
@@ -463,7 +460,10 @@ fn is_review_file_structure(rest: &str) -> bool {
         rest
     };
     // Base (codename-branch) must be non-empty and only contain valid chars
-    !base.is_empty() && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    !base.is_empty()
+        && base
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn is_cleanup_candidate(rest: &str, extension: &str) -> bool {
@@ -513,9 +513,7 @@ pub fn list_review_files(bod_dir: &Path) -> Vec<String> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy().to_string();
-            if name.ends_with(".md")
-                && !files::is_bugfix_log(&name)
-                && !is_consolidated_file(&name)
+            if name.ends_with(".md") && !files::is_bugfix_log(&name) && !is_consolidated_file(&name)
             {
                 files.push(name);
             }
@@ -788,10 +786,7 @@ pub fn group_reviews_by_round(files: &[String]) -> HashMap<String, Vec<String>> 
 
     for file in files {
         if let Some(ts) = extract_timestamp(file) {
-            groups
-                .entry(ts.to_string())
-                .or_default()
-                .push(file.clone());
+            groups.entry(ts.to_string()).or_default().push(file.clone());
         } else {
             groups
                 .entry("legacy".to_string())
@@ -906,8 +901,7 @@ mod tests {
         // plus millisecond bucketing, a single pair has ~1/65536 collision
         // probability. Collecting many samples and checking the full set is
         // robust against same-millisecond collisions.
-        let ids: std::collections::HashSet<String> =
-            (0..100).map(|_| timestamp_now()).collect();
+        let ids: std::collections::HashSet<String> = (0..100).map(|_| timestamp_now()).collect();
         assert_eq!(ids.len(), 100, "expected 100 unique round IDs");
     }
 
@@ -1001,10 +995,7 @@ mod tests {
 
         let latest = latest_review_files(&files, &codenames, "feature").unwrap();
         // Should pick the later timestamp (153046), not the higher nonce
-        assert_eq!(
-            latest,
-            vec!["20260316153046n00000001-opus-feature.md"]
-        );
+        assert_eq!(latest, vec!["20260316153046n00000001-opus-feature.md"]);
     }
 
     #[test]
@@ -1064,20 +1055,30 @@ mod tests {
 
     #[test]
     fn is_consolidated_file_true_14_digit() {
-        assert!(is_consolidated_file("20260316153045-consolidated-feature.md"));
-        assert!(is_consolidated_file("20260316153045-consolidated-feature~2.md"));
+        assert!(is_consolidated_file(
+            "20260316153045-consolidated-feature.md"
+        ));
+        assert!(is_consolidated_file(
+            "20260316153045-consolidated-feature~2.md"
+        ));
     }
 
     #[test]
     fn is_consolidated_file_true_with_nonce() {
-        assert!(is_consolidated_file("20260316153045n1a2b3c4d-consolidated-feature.md"));
-        assert!(is_consolidated_file("20260316153045ndeadbeef-consolidated-feature~2.md"));
+        assert!(is_consolidated_file(
+            "20260316153045n1a2b3c4d-consolidated-feature.md"
+        ));
+        assert!(is_consolidated_file(
+            "20260316153045ndeadbeef-consolidated-feature~2.md"
+        ));
     }
 
     #[test]
     fn is_consolidated_file_true_legacy_12_digit() {
         assert!(is_consolidated_file("202603161530-consolidated-feature.md"));
-        assert!(is_consolidated_file("202603161530-consolidated-feature~2.md"));
+        assert!(is_consolidated_file(
+            "202603161530-consolidated-feature~2.md"
+        ));
     }
 
     #[test]
@@ -1089,9 +1090,13 @@ mod tests {
     #[test]
     fn is_consolidated_file_rejects_invalid_timestamp() {
         // All-9s timestamp is out of range -- should not be classified as consolidated
-        assert!(!is_consolidated_file("99999999999999-consolidated-feature.md"));
+        assert!(!is_consolidated_file(
+            "99999999999999-consolidated-feature.md"
+        ));
         // Invalid month
-        assert!(!is_consolidated_file("20261316153045-consolidated-feature.md"));
+        assert!(!is_consolidated_file(
+            "20261316153045-consolidated-feature.md"
+        ));
     }
 
     #[test]
@@ -1147,7 +1152,11 @@ mod tests {
         fs::write(dir.path().join("20260316153045-codex-feature.md"), "").unwrap();
         fs::write(dir.path().join("20260316153045-opus-other.md"), "").unwrap();
         fs::write(dir.path().join("opus-feature.md"), "").unwrap();
-        fs::write(dir.path().join("20260316153045-consolidated-feature.md"), "").unwrap();
+        fs::write(
+            dir.path().join("20260316153045-consolidated-feature.md"),
+            "",
+        )
+        .unwrap();
         fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         let files = list_review_files_for_branch(
@@ -1168,9 +1177,14 @@ mod tests {
     #[test]
     fn list_consolidated_files_for_branch_filters_current_branch() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("20260316153045-consolidated-feature.md"), "").unwrap();
         fs::write(
-            dir.path().join("20260316153045n000000000001-consolidated-feature~2.md"),
+            dir.path().join("20260316153045-consolidated-feature.md"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join("20260316153045n000000000001-consolidated-feature~2.md"),
             "",
         )
         .unwrap();
@@ -1192,7 +1206,11 @@ mod tests {
     #[test]
     fn list_consolidated_files_includes_legacy_and_timestamped() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("20260316153045-consolidated-feature.md"), "").unwrap();
+        fs::write(
+            dir.path().join("20260316153045-consolidated-feature.md"),
+            "",
+        )
+        .unwrap();
         fs::write(dir.path().join("consolidated-main.md"), "").unwrap();
         fs::write(dir.path().join("bugfix-main.log.md"), "").unwrap();
 
@@ -1294,10 +1312,7 @@ mod tests {
         let codenames = vec!["opus".to_string(), "gemini".to_string()];
 
         let latest = latest_review_files(&files, &codenames, "feature").unwrap();
-        assert_eq!(
-            latest,
-            vec!["gemini-feature.md", "opus-feature.md"]
-        );
+        assert_eq!(latest, vec!["gemini-feature.md", "opus-feature.md"]);
     }
 
     #[test]
@@ -1325,11 +1340,7 @@ mod tests {
         let latest = latest_review_files(&files, &codenames, "feature").unwrap();
         assert_eq!(
             latest,
-            vec![
-                "codex-feature-1.md",
-                "codex-feature.md",
-                "opus-feature.md",
-            ]
+            vec!["codex-feature-1.md", "codex-feature.md", "opus-feature.md",]
         );
     }
 
@@ -1410,8 +1421,16 @@ mod tests {
         fs::write(dir.path().join("20260316153045-opus-feature.md"), "").unwrap();
         fs::write(dir.path().join("20260316200015-opus-feature.md"), "").unwrap();
         // Timestamped consolidated reports sharing the same round prefix
-        fs::write(dir.path().join("20260316153045-consolidated-feature.md"), "").unwrap();
-        fs::write(dir.path().join("20260316200015-consolidated-feature.md"), "").unwrap();
+        fs::write(
+            dir.path().join("20260316153045-consolidated-feature.md"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("20260316200015-consolidated-feature.md"),
+            "",
+        )
+        .unwrap();
         fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         // keep=1: evict the oldest round's reviews but preserve consolidated reports.
@@ -1420,8 +1439,16 @@ mod tests {
         assert!(!dir.path().join("20260316153045-opus-feature.md").exists());
         assert!(dir.path().join("20260316200015-opus-feature.md").exists());
         // Both consolidated reports are preserved
-        assert!(dir.path().join("20260316153045-consolidated-feature.md").exists());
-        assert!(dir.path().join("20260316200015-consolidated-feature.md").exists());
+        assert!(
+            dir.path()
+                .join("20260316153045-consolidated-feature.md")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("20260316200015-consolidated-feature.md")
+                .exists()
+        );
         assert!(dir.path().join("bugfix-feature.log.md").exists());
     }
 
@@ -1476,29 +1503,98 @@ mod tests {
     #[test]
     fn cleanup_old_rounds_removes_large_diff_artifacts_with_old_rounds() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("20260316153045n000000000001-opus-feature.md"), "").unwrap();
-        fs::write(dir.path().join("20260316153045n000000000001-diff-feature.patch"), "").unwrap();
-        fs::write(dir.path().join("20260316153045n000000000001-diffstat-feature.txt"), "").unwrap();
-        fs::write(dir.path().join("20260316153045n000000000001-files-feature.txt"), "").unwrap();
-        fs::write(dir.path().join("20260316200015n000000000002-opus-feature.md"), "").unwrap();
-        fs::write(dir.path().join("20260316200015n000000000002-diff-feature.patch"), "").unwrap();
+        fs::write(
+            dir.path()
+                .join("20260316153045n000000000001-opus-feature.md"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join("20260316153045n000000000001-diff-feature.patch"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join("20260316153045n000000000001-diffstat-feature.txt"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join("20260316153045n000000000001-files-feature.txt"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join("20260316200015n000000000002-opus-feature.md"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join("20260316200015n000000000002-diff-feature.patch"),
+            "",
+        )
+        .unwrap();
 
         let removed = cleanup_old_rounds(dir.path(), 1).unwrap();
         assert_eq!(removed, 4);
-        assert!(!dir.path().join("20260316153045n000000000001-opus-feature.md").exists());
-        assert!(!dir.path().join("20260316153045n000000000001-diff-feature.patch").exists());
-        assert!(!dir.path().join("20260316153045n000000000001-diffstat-feature.txt").exists());
-        assert!(!dir.path().join("20260316153045n000000000001-files-feature.txt").exists());
-        assert!(dir.path().join("20260316200015n000000000002-opus-feature.md").exists());
-        assert!(dir.path().join("20260316200015n000000000002-diff-feature.patch").exists());
+        assert!(
+            !dir.path()
+                .join("20260316153045n000000000001-opus-feature.md")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("20260316153045n000000000001-diff-feature.patch")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("20260316153045n000000000001-diffstat-feature.txt")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("20260316153045n000000000001-files-feature.txt")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("20260316200015n000000000002-opus-feature.md")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("20260316200015n000000000002-diff-feature.patch")
+                .exists()
+        );
     }
 
     #[test]
     fn list_review_context_artifact_files_returns_known_artifacts_only() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("20260316153045n000000000001-diff-feature.patch"), "").unwrap();
-        fs::write(dir.path().join("20260316153045n000000000001-diffstat-feature.txt"), "").unwrap();
-        fs::write(dir.path().join("20260316153045n000000000001-files-feature.txt"), "").unwrap();
+        fs::write(
+            dir.path()
+                .join("20260316153045n000000000001-diff-feature.patch"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join("20260316153045n000000000001-diffstat-feature.txt"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path()
+                .join("20260316153045n000000000001-files-feature.txt"),
+            "",
+        )
+        .unwrap();
         fs::write(dir.path().join("keep-me.txt"), "").unwrap();
 
         let files = list_review_context_artifact_files(dir.path());
@@ -1603,18 +1699,14 @@ mod tests {
     #[test]
     fn create_review_file_is_atomic() {
         let dir = tempfile::tempdir().unwrap();
-        let (name1, mut f1) = create_review_file(
-            dir.path(), "opus", "feature", "20260316153045",
-        )
-        .unwrap();
+        let (name1, mut f1) =
+            create_review_file(dir.path(), "opus", "feature", "20260316153045").unwrap();
         f1.disarm(); // Keep the file so the second call gets a collision suffix
         assert_eq!(name1, "20260316153045-opus-feature.md");
 
         // Second call with same params gets collision suffix
-        let (name2, mut f2) = create_review_file(
-            dir.path(), "opus", "feature", "20260316153045",
-        )
-        .unwrap();
+        let (name2, mut f2) =
+            create_review_file(dir.path(), "opus", "feature", "20260316153045").unwrap();
         f2.disarm();
         assert_eq!(name2, "20260316153045-opus-feature~2.md");
     }
@@ -1647,23 +1739,28 @@ mod tests {
         fs::write(dir.path().join("bugfix-feature.log.md"), "").unwrap();
 
         let codenames = vec!["opus".to_string()];
-        let result = list_review_files_for_round_id(
-            dir.path(), "20260316153045", None, &codenames,
-        );
+        let result = list_review_files_for_round_id(dir.path(), "20260316153045", None, &codenames);
         assert_eq!(result, vec!["20260316153045-opus-feature.md"]);
     }
 
     #[test]
     fn list_review_files_for_round_id_mismatched_nonce() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("20260316153045n1a2b3c4d-opus-feature.md"), "").unwrap();
-        fs::write(dir.path().join("20260316153045ndeadbeef-opus-feature.md"), "").unwrap();
+        fs::write(
+            dir.path().join("20260316153045n1a2b3c4d-opus-feature.md"),
+            "",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("20260316153045ndeadbeef-opus-feature.md"),
+            "",
+        )
+        .unwrap();
 
         let codenames = vec!["opus".to_string()];
         // Only files matching the exact round ID (including nonce) should be returned.
-        let result = list_review_files_for_round_id(
-            dir.path(), "20260316153045n1a2b3c4d", None, &codenames,
-        );
+        let result =
+            list_review_files_for_round_id(dir.path(), "20260316153045n1a2b3c4d", None, &codenames);
         assert_eq!(result, vec!["20260316153045n1a2b3c4d-opus-feature.md"]);
     }
 
@@ -1675,7 +1772,10 @@ mod tests {
 
         let codenames = vec!["opus".to_string()];
         let result = list_review_files_for_round_id(
-            dir.path(), "20260316153045", Some("feature"), &codenames,
+            dir.path(),
+            "20260316153045",
+            Some("feature"),
+            &codenames,
         );
         assert_eq!(result, vec!["20260316153045-opus-feature.md"]);
     }
@@ -1687,7 +1787,10 @@ mod tests {
 
         let codenames = vec!["opus".to_string()];
         let result = list_review_files_for_round_id(
-            dir.path(), "20260316153045", Some("bugfix"), &codenames,
+            dir.path(),
+            "20260316153045",
+            Some("bugfix"),
+            &codenames,
         );
         assert!(result.is_empty());
     }
@@ -1700,12 +1803,18 @@ mod tests {
 
         let codenames = vec!["opus".to_string()];
         let result = list_review_files_for_round_id(
-            dir.path(), "20260316153045", Some("feature"), &codenames,
+            dir.path(),
+            "20260316153045",
+            Some("feature"),
+            &codenames,
         );
-        assert_eq!(result, vec![
-            "20260316153045-opus-feature.md",
-            "20260316153045-opus-feature~2.md",
-        ]);
+        assert_eq!(
+            result,
+            vec![
+                "20260316153045-opus-feature.md",
+                "20260316153045-opus-feature~2.md",
+            ]
+        );
     }
 
     #[test]
@@ -1716,7 +1825,10 @@ mod tests {
 
         let codenames = vec!["claude-opus".to_string()];
         let result = list_review_files_for_round_id(
-            dir.path(), "20260316153045", Some("feature"), &codenames,
+            dir.path(),
+            "20260316153045",
+            Some("feature"),
+            &codenames,
         );
         assert_eq!(result, vec!["20260316153045-claude-opus-feature.md"]);
     }
@@ -1730,9 +1842,7 @@ mod tests {
 
         let codenames = vec!["opus".to_string()];
         // None branch filter: return all files for the round.
-        let result = list_review_files_for_round_id(
-            dir.path(), "20260316153045", None, &codenames,
-        );
+        let result = list_review_files_for_round_id(dir.path(), "20260316153045", None, &codenames);
         assert_eq!(result.len(), 2);
         assert!(result.contains(&"20260316153045-opus-feature.md".to_string()));
         assert!(result.contains(&"20260316153045-opus-bugfix.md".to_string()));

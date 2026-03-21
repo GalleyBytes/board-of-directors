@@ -44,15 +44,13 @@ pub fn run(repo_root: &Path, mode: ClearMode) -> Result<(), String> {
         ClearMode::Default => {
             println!(
                 "Cleared {} review artifact(s) and reset {} bugfix log(s) while keeping saved notes.",
-                summary.review_artifacts_removed,
-                summary.bugfix_logs_cleared
+                summary.review_artifacts_removed, summary.bugfix_logs_cleared
             );
         }
         ClearMode::All => {
             println!(
                 "Cleared {} review artifact(s) and removed {} bugfix log(s).",
-                summary.review_artifacts_removed,
-                summary.bugfix_logs_removed
+                summary.review_artifacts_removed, summary.bugfix_logs_removed
             );
         }
     }
@@ -209,12 +207,32 @@ mod tests {
 
         run_in_state_dir(dir.path(), ClearMode::Reviews).unwrap();
 
-        assert!(!dir.path().join("20260320120000nabcdef-opus-main.md").exists());
-        assert!(!dir.path().join("20260320120000nabcdef-consolidated-main.md").exists());
+        assert!(
+            !dir.path()
+                .join("20260320120000nabcdef-opus-main.md")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("20260320120000nabcdef-consolidated-main.md")
+                .exists()
+        );
         assert!(!dir.path().join("consolidated-main.md").exists());
-        assert!(!dir.path().join("20260320120000nabcdef-diff-main.patch").exists());
-        assert!(!dir.path().join("20260320120000nabcdef-diffstat-main.txt").exists());
-        assert!(!dir.path().join("20260320120000nabcdef-files-main.txt").exists());
+        assert!(
+            !dir.path()
+                .join("20260320120000nabcdef-diff-main.patch")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("20260320120000nabcdef-diffstat-main.txt")
+                .exists()
+        );
+        assert!(
+            !dir.path()
+                .join("20260320120000nabcdef-files-main.txt")
+                .exists()
+        );
         assert!(dir.path().join("bugfix-main.log.md").exists());
         assert!(dir.path().join("config.toml").exists());
         assert!(dir.path().join("keep-me.md").exists());
@@ -265,7 +283,11 @@ mod tests {
             "consolidated",
         )
         .unwrap();
-        std::fs::write(state_dir.join("consolidated-main.md"), "legacy consolidated").unwrap();
+        std::fs::write(
+            state_dir.join("consolidated-main.md"),
+            "legacy consolidated",
+        )
+        .unwrap();
         std::fs::write(
             state_dir.join("20260320120000nabcdef-diff-main.patch"),
             "patch",

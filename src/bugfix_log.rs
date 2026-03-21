@@ -175,9 +175,7 @@ pub fn clear_history_preserving_notes_file(path: &Path) -> Result<bool, String> 
     })();
 
     let _ = lock_file.unlock();
-    let removed_log = matches!(result, Ok(ClearOutcome::Removed));
-    drop(lock_file);
-    if removed_log {
+    if let Ok(ClearOutcome::Removed) = &result {
         let _ = std::fs::remove_file(&lock_path);
     }
 

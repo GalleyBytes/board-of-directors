@@ -3,8 +3,8 @@ use tokio::process::Command;
 
 /// Build a Gemini CLI command.
 ///
-/// The prompt is delivered via the `--prompt` argument. Large prompts may still
-/// hit OS argument-size limits and will be visible in `ps` output.
+/// The prompt is delivered via stdin so large diffs do not leak through process
+/// arguments or hit OS argument-size limits.
 pub async fn command(
     model: &str,
     working_dir: &Path,
@@ -14,12 +14,7 @@ pub async fn command(
     state_dir: &Path,
 ) -> std::io::Result<Command> {
     let mut command = Command::new("gemini");
-    command.env("GIT_CONFIG_GLOBAL", crate::backend::NULL_DEVICE);
-    command.env("GIT_CONFIG_SYSTEM", crate::backend::NULL_DEVICE);
     crate::backend::apply_node_heap_limit(&mut command);
-    // Sanitize environment when repository access is not allowed to reduce
-    // risk of deny-list bypass via child processes (unset git envs, use curated PATH).
-    crate::backend::sanitize_command_env(&mut command, allow_repo_access, "gemini").await?;
     command.current_dir(working_dir);
     command
         .arg("--model")
@@ -41,7 +36,6 @@ pub async fn command(
 
 pub const REQUIRED_CLI_FLAGS: &[&str] = &[
     "--model",
-    "--prompt",
     "--approval-mode",
     "--include-directories",
     "--output-format",
@@ -80,12 +74,12 @@ mod tests {
     #[test]
     fn detects_missing_required_flags() {
         let error = check_required_flags("--model", "").unwrap_err();
-        assert!(error.contains("--prompt"));
+        assert!(error.contains("--approval-mode"));
     }
 
     #[test]
     fn accepts_help_output_with_required_flags() {
-        let help = "--model --prompt --approval-mode --include-directories --output-format";
+        let help = "--model --approval-mode --include-directories --output-format";
         assert!(check_required_flags(help, "").is_ok());
     }
 }

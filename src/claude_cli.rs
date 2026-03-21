@@ -13,14 +13,8 @@ pub async fn command(
     state_dir: &Path,
 ) -> std::io::Result<Command> {
     let mut command = Command::new("claude");
-    // Defense-in-depth: override git config paths to prevent the agent from
-    // reading user aliases or writing persistent config via indirect invocation.
-    command.env("GIT_CONFIG_GLOBAL", crate::backend::NULL_DEVICE);
-    command.env("GIT_CONFIG_SYSTEM", crate::backend::NULL_DEVICE);
     // Apply Node heap limit to avoid OOMs on large inputs (same as other backends).
     crate::backend::apply_node_heap_limit(&mut command);
-    // Sanitize environment for runs that should not access the repository.
-    crate::backend::sanitize_command_env(&mut command, allow_repo_access, "claude").await?;
     command.current_dir(working_dir);
     command
         .arg("--print")
@@ -38,11 +32,7 @@ pub async fn command(
 /// Flags that `command()` unconditionally passes to the Claude CLI.
 /// `verify_required_flags()` and the sync init-time check both use
 /// this list so they stay in sync with what `command()` actually invokes.
-pub const REQUIRED_CLI_FLAGS: &[&str] = &[
-    "--print",
-    "--add-dir",
-    "--dangerously-skip-permissions",
-];
+pub const REQUIRED_CLI_FLAGS: &[&str] = &["--print", "--add-dir", "--dangerously-skip-permissions"];
 
 /// Verify that the given `claude --help` output contains all required CLI flags.
 /// Shared between the async startup check and the sync init-time check to avoid

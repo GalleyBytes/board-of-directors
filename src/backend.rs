@@ -2,23 +2,19 @@ use crate::claude_cli;
 use crate::config::Backend;
 use crate::copilot_cli;
 use crate::gemini_cli;
+use fs2::FileExt;
 use regex::Regex;
 use std::env;
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-/// Null device path, platform-specific. Used to override git config paths.
-pub const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 const NODE_HEAP_LIMIT_MB: &str = "8192";
-
-/// Git subcommands denied by the Copilot backend (`--deny-tool=shell(git <subcmd>)`).
-/// Board of Directors intentionally allows normal git research and shell usage.
-/// The only built-in git restrictions are `git commit` and `git push`.
-pub const DENIED_GIT_SUBCOMMANDS: &[&str] = &["commit", "push"];
 
 /// Default agent timeout: 30 minutes.
 ///
@@ -131,7 +127,7 @@ async fn run_agent_inner_with_cancel(
             return Ok(AgentRunResult::Completed(output));
         }
 
-            if retry_count >= RATE_LIMIT_MAX_RETRIES {
+        if retry_count >= RATE_LIMIT_MAX_RETRIES {
             let msg = format!(
                 "Rate limit persisted after {} retries for backend '{}' and model '{}'. Giving up.",
                 RATE_LIMIT_MAX_RETRIES, backend, model
@@ -176,6 +172,283 @@ async fn run_agent_inner_with_cancel(
     }
 }
 
+fn apply_git_wrapper(
+    command: &mut tokio::process::Command,
+    state_dir: &Path,
+) -> std::io::Result<()> {
+    let bin_dir = state_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let git_wrapper_path = bin_dir.join(git_wrapper_filename());
+    let real_git = resolve_git_executable(Some(&bin_dir))?;
+    apply_git_wrapper_with_executable(command, &bin_dir, &git_wrapper_path, &real_git)?;
+
+    Ok(())
+}
+
+fn apply_git_wrapper_with_executable(
+    command: &mut tokio::process::Command,
+    bin_dir: &Path,
+    git_wrapper_path: &Path,
+    real_git: &Path,
+) -> std::io::Result<()> {
+    let script = build_git_wrapper_script(real_git);
+    write_wrapper_script(git_wrapper_path, &script)?;
+
+    let mut paths = vec![bin_dir.to_path_buf()];
+    if let Some(existing_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing_path));
+    }
+    let new_path = std::env::join_paths(paths).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+    })?;
+    command.env("PATH", new_path);
+    Ok(())
+}
+
+fn resolve_git_executable(exclude_dir: Option<&Path>) -> std::io::Result<PathBuf> {
+    let path = std::env::var_os("PATH").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "PATH is not set; unable to locate git.",
+        )
+    })?;
+
+    for dir in std::env::split_paths(&path) {
+        for candidate in git_candidates(&dir) {
+            if let Some(excluded) = exclude_dir {
+                if candidate.parent() == Some(excluded) {
+                    continue;
+                }
+            }
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "Unable to locate the git executable in PATH.",
+    ))
+}
+
+#[cfg(windows)]
+fn git_candidates(dir: &Path) -> Vec<PathBuf> {
+    vec![
+        dir.join("git.exe"),
+        dir.join("git.cmd"),
+        dir.join("git.bat"),
+        dir.join("git"),
+    ]
+}
+
+#[cfg(not(windows))]
+fn git_candidates(dir: &Path) -> Vec<PathBuf> {
+    vec![dir.join("git")]
+}
+
+fn build_git_wrapper_script(real_git: &Path) -> String {
+    #[cfg(windows)]
+    {
+        build_windows_git_wrapper_script(real_git)
+    }
+    #[cfg(not(windows))]
+    {
+        build_unix_git_wrapper_script(real_git)
+    }
+}
+
+#[cfg(not(windows))]
+fn build_unix_git_wrapper_script(real_git: &Path) -> String {
+    let real_git = shell_single_quote(real_git);
+    format!(
+        r#"#!/bin/sh
+git_subcommand=""
+find_git_subcommand() {{
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --)
+                shift
+                break
+                ;;
+            -C|-c|--git-dir|--work-tree|--namespace|--separate-git-dir|--super-prefix|--exec-path)
+                shift
+                if [ "$#" -gt 0 ]; then
+                    shift
+                fi
+                ;;
+            -C*|-c*|--git-dir=*|--work-tree=*|--namespace=*|--separate-git-dir=*|--super-prefix=*|--exec-path=*)
+                shift
+                ;;
+            -*)
+                shift
+                ;;
+            *)
+                git_subcommand=$1
+                break
+                ;;
+        esac
+    done
+}}
+find_git_subcommand "$@"
+if [ "$git_subcommand" = "commit" ] || [ "$git_subcommand" = "push" ]; then
+    printf '%s\n' "Git commit/push blocked by Board of Directors." >&2
+    exit 1
+fi
+exec {real_git} "$@"
+"#
+    )
+}
+
+#[cfg(windows)]
+fn build_windows_git_wrapper_script(real_git: &Path) -> String {
+    let real_git = format!("\"{}\"", real_git.to_string_lossy());
+    format!(
+        r#"@echo off
+setlocal EnableExtensions
+set "git_subcommand="
+:scan
+if "%~1"=="" goto check
+set "arg=%~1"
+if /I "%arg%"=="--" goto after_double_dash
+if /I "%arg%"=="-C" goto consume_next
+if /I "%arg%"=="-c" goto consume_next
+if /I "%arg%"=="--git-dir" goto consume_next
+if /I "%arg%"=="--work-tree" goto consume_next
+if /I "%arg%"=="--namespace" goto consume_next
+if /I "%arg%"=="--separate-git-dir" goto consume_next
+if /I "%arg%"=="--super-prefix" goto consume_next
+if /I "%arg%"=="--exec-path" goto consume_next
+if /I "%arg:~0,2%"=="-C" goto consume_one
+if /I "%arg:~0,2%"=="-c" goto consume_one
+if /I "%arg:~0,10%"=="--git-dir=" goto consume_one
+if /I "%arg:~0,12%"=="--work-tree=" goto consume_one
+if /I "%arg:~0,12%"=="--namespace=" goto consume_one
+if /I "%arg:~0,19%"=="--separate-git-dir=" goto consume_one
+if /I "%arg:~0,15%"=="--super-prefix=" goto consume_one
+if /I "%arg:~0,12%"=="--exec-path=" goto consume_one
+if "%arg:~0,1%"=="-" goto consume_one
+set "git_subcommand=%arg%"
+goto check
+:consume_next
+shift
+if "%~1"=="" goto check
+shift
+goto scan
+:consume_one
+shift
+goto scan
+:after_double_dash
+shift
+if "%~1"=="" goto check
+set "git_subcommand=%~1"
+goto check
+:check
+if /I "%git_subcommand%"=="commit" goto blocked
+if /I "%git_subcommand%"=="push" goto blocked
+call {real_git} %*
+exit /b %ERRORLEVEL%
+:blocked
+>&2 echo Git commit/push blocked by Board of Directors.
+exit /b 1
+"#
+    )
+}
+
+fn shell_single_quote(value: &Path) -> String {
+    let escaped = value.to_string_lossy().replace('\'', "'\"'\"'");
+    format!("'{}'", escaped)
+}
+
+fn write_wrapper_script(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("lock");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    lock_file.lock_exclusive()?;
+    let result = write_wrapper_script_locked(path, contents);
+    let _ = lock_file.unlock();
+    result
+}
+
+#[cfg(not(windows))]
+fn write_wrapper_script_locked(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "git wrapper path has no parent directory",
+        )
+    })?;
+    let stem = path.file_name().and_then(|name| name.to_str()).unwrap_or("git");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..16u32 {
+        let temp_path = parent.join(format!(".{}.{}.{}.tmp", stem, nanos, attempt));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o755);
+        }
+
+        match options.open(&temp_path) {
+            Ok(mut file) => {
+                let write_result = file
+                    .write_all(contents.as_bytes())
+                    .and_then(|_| file.sync_all());
+                drop(file);
+                if let Err(err) = write_result {
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(err);
+                }
+                if let Err(err) = std::fs::rename(&temp_path, path) {
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(err);
+                }
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "Failed to create a unique temporary file for the git wrapper.",
+    ))
+}
+
+#[cfg(windows)]
+fn write_wrapper_script_locked(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn git_wrapper_filename() -> &'static str {
+    "git.cmd"
+}
+
+#[cfg(not(windows))]
+fn git_wrapper_filename() -> &'static str {
+    "git"
+}
+
 async fn run_agent_once_with_cancel(
     backend: &Backend,
     prompt: &str,
@@ -207,28 +480,30 @@ async fn run_agent_once_with_cancel(
                 allow_repo_access,
                 repo_root,
                 state_dir,
-            ).await?;
+            )
+            .await?;
+            let mut cmd = cmd;
+            apply_git_wrapper(&mut cmd, state_dir)?;
             spawn_command(cmd, None)?
         }
         Backend::ClaudeCode => {
-            let cmd = claude_cli::command(
-                model,
-                working_dir,
-                allow_repo_access,
-                repo_root,
-                state_dir,
-            ).await?;
+            let mut cmd =
+                claude_cli::command(model, working_dir, allow_repo_access, repo_root, state_dir)
+                    .await?;
+            apply_git_wrapper(&mut cmd, state_dir)?;
             spawn_command(cmd, Some(prompt.as_bytes().to_vec()))?
         }
         Backend::GeminiCli => {
-            let cmd = gemini_cli::command(
+            let mut cmd = gemini_cli::command(
                 model,
                 working_dir,
                 allow_repo_access,
                 use_sandbox,
                 repo_root,
                 state_dir,
-            ).await?;
+            )
+            .await?;
+            apply_git_wrapper(&mut cmd, state_dir)?;
             spawn_command(cmd, Some(prompt.as_bytes().to_vec()))?
         }
     };
@@ -292,7 +567,8 @@ fn retry_delay_from_output(output: &std::process::Output) -> Option<Duration> {
 fn extract_retry_delay(text: &str) -> Option<Duration> {
     // Prefer structured headers like "Retry-After: <seconds>"
     static RETRY_AFTER_RE: OnceLock<Regex> = OnceLock::new();
-    let retry_after_re = RETRY_AFTER_RE.get_or_init(|| Regex::new(r"(?i)retry-after\s*:\s*(\d+)").unwrap());
+    let retry_after_re =
+        RETRY_AFTER_RE.get_or_init(|| Regex::new(r"(?i)retry-after\s*:\s*(\d+)").unwrap());
     if let Some(caps) = retry_after_re.captures(text) {
         if let Ok(secs) = caps[1].parse::<u64>() {
             return Some(Duration::from_secs(secs.max(1)));
@@ -304,7 +580,10 @@ fn extract_retry_delay(text: &str) -> Option<Duration> {
     let key_re = Regex::new(r"(?i)(?:retry_after|retryafter|retrydelay|retry-after)").unwrap();
     if let Some(m) = key_re.find(text) {
         let suffix = &text[m.end()..];
-        let val_re = Regex::new(r##"(?i)[:=]\s*\"?(\d+(?:\.\d+)?)(s|sec|secs|seconds|m|min|mins|minutes)?\"?"##).unwrap();
+        let val_re = Regex::new(
+            r##"(?i)[:=]\s*\"?(\d+(?:\.\d+)?)(s|sec|secs|seconds|m|min|mins|minutes)?\"?"##,
+        )
+        .unwrap();
         if let Some(caps) = val_re.captures(suffix) {
             let val = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             let unit = caps.get(2).map(|m| m.as_str()).unwrap_or("s");
@@ -315,7 +594,10 @@ fn extract_retry_delay(text: &str) -> Option<Duration> {
     static PHRASE_RE: OnceLock<Regex> = OnceLock::new();
     let phrase_re = PHRASE_RE.get_or_init(|| Regex::new(r##"(?i)\b(?:retry(?: after| in)?|try again in|wait(?: for)?|available in|reset in)\b[^0-9]{0,20}\b(\d+(?:\.\d+)?)\b\s*(seconds?|secs?|s|minutes?|mins?|m)\b"##).unwrap());
     if let Some(caps) = phrase_re.captures(text) {
-        return duration_from_capture(caps.get(1).map(|m| m.as_str())?, caps.get(2).map(|m| m.as_str()).unwrap_or("s"));
+        return duration_from_capture(
+            caps.get(1).map(|m| m.as_str())?,
+            caps.get(2).map(|m| m.as_str()).unwrap_or("s"),
+        );
     }
 
     None
@@ -532,295 +814,6 @@ fn merge_node_options(existing: Option<&str>, heap_limit_mb: &str) -> String {
     }
 }
 
-/// Sanitize the child process environment for runs that must not access the
-/// repository or invoke git. This unsets common git-related environment
-/// variables and constructs a curated, persistent safe-PATH that uses
-/// symlinks or small wrapper shims instead of copying full binaries per-run.
-///
-/// Behavior:
-/// - If allow_repo_access is true, no changes are made.
-/// - Attempts to create or reuse a persistent safe-bin under XDG_CONFIG_HOME
-///   (or HOME/.config/board-of-directors/safe-bin). If that is not writable
-///   the system temp dir fallback is used.
-/// - For each allowed helper binary found on PATH, a symlink is created in the
-///   safe-bin pointing to the original binary on Unix. On platforms without
-///   reliable symlink support (Windows), a small wrapper batch file is created
-///   that forwards arguments to the real binary. Existing entries are updated
-///   if they point to a different target. This avoids copying large binaries
-///   per-run and ensures predictable PATH contents.
-/// - If no allowed binaries (including the program itself) can be located,
-///   an error is returned.
-pub async fn sanitize_command_env(cmd: &mut tokio::process::Command, allow_repo_access: bool, program_name: &str) -> std::io::Result<()> {
-    use std::io;
-    use fs2::FileExt;
-    if allow_repo_access {
-        return Ok(());
-    }
-
-    // Unset common git-related env vars.
-    let git_envs = [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_CONFIG",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_SYSTEM",
-        "GIT_SSH",
-        "GIT_TERMINAL_PROMPT",
-        "GIT_SSL_NO_VERIFY",
-    ];
-    for key in git_envs.iter() {
-        cmd.env_remove(key);
-    }
-
-    // Allowed helper binaries. The program_name is appended to ensure it is
-    // resolvable when PATH is replaced.
-    // NOTE: do NOT include shells or `env` here. Allowing shells (sh, bash)
-    // enables shell-driven bypasses such as `sh -c "/usr/bin/git ..."` which
-    // would defeat PATH-only sanitization. Absolute-path programs are refused
-    // below.
-    let mut allowed_bins = vec!["printf", "sleep", "cat", "sed", "awk", "grep", "xargs"];
-    if !allowed_bins.contains(&program_name) {
-        allowed_bins.push(program_name);
-    }
-    allowed_bins.sort();
-    allowed_bins.dedup();
-
-    // Reject program names that look like absolute paths or shells. Allowing
-    // shells (sh/bash) or raw absolute paths would let an agent execute
-    // absolute-path binaries such as /usr/bin/git and bypass PATH-based
-    // sanitization.
-    if program_name.contains('/') || program_name.contains('\\')
-        || program_name.eq_ignore_ascii_case("sh")
-        || program_name.eq_ignore_ascii_case("bash")
-        || program_name.eq_ignore_ascii_case("env")
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("sanitize_command_env: refusing to allow shell or absolute-path program '{}'", program_name),
-        ));
-    }
-
-    // Helper to find an executable in a directory with PATHEXT awareness on Windows.
-    fn find_in_dir(bin: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
-        #[cfg(windows)]
-        {
-            let pathext = std::env::var_os("PATHEXT").map(|s| s.into_string().unwrap_or_default()).unwrap_or_else(|| ".EXE;.CMD;.BAT;.COM".to_string());
-            let exts: Vec<&str> = pathext.split(';').filter_map(|s| {
-                let s = s.trim();
-                if s.is_empty() { None } else { Some(s) }
-            }).collect();
-            // Try the name as-is first, then with extensions.
-            let candidate = dir.join(bin);
-            if candidate.exists() { return Some(candidate); }
-            for ext in exts {
-                // ext may include leading dot
-                let candidate = dir.join(format!("{}{}", bin, ext));
-                if candidate.exists() { return Some(candidate); }
-            }
-            None
-        }
-        #[cfg(not(windows))]
-        {
-            let candidate = dir.join(bin);
-            if candidate.exists() { Some(candidate) } else { None }
-        }
-    }
-
-    // Find candidate sources for each allowed binary from the existing PATH,
-    // skipping any candidate that is the git executable. PATHEXT-aware on Windows.
-    let path_os = std::env::var_os("PATH").unwrap_or_default();
-    let git_name = if cfg!(windows) { "git" } else { "git" };
-    let mut sources: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for bin in allowed_bins.iter() {
-        if bin.eq_ignore_ascii_case(&git_name) {
-            continue;
-        }
-        let mut found = None;
-        for p in std::env::split_paths(&path_os) {
-            if let Some(src) = find_in_dir(bin, &p) {
-                // Avoid selecting git even if it's named differently (git.exe etc).
-                if let Some(fname) = src.file_name().and_then(|s| s.to_str()) {
-                    if fname.to_ascii_lowercase().starts_with("git") {
-                        continue;
-                    }
-                }
-                found = Some(src);
-                break;
-            }
-        }
-        if let Some(src) = found {
-            sources.push((bin.to_string(), src));
-        }
-    }
-
-    if sources.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "sanitize_command_env: unable to construct a minimal safe PATH; no allowed binaries found. Refusing to run to avoid exposing git."
-        ));
-    }
-
-    // Determine persistent safe-dir location. Prefer XDG_CONFIG_HOME or
-    // HOME/.config/board-of-directors/safe-bin. Fallback to system temp dir.
-    let safe_dir = if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        std::path::PathBuf::from(xdg).join("board-of-directors").join("safe-bin")
-    } else if let Ok(home) = std::env::var("HOME") {
-        std::path::PathBuf::from(home).join(".config").join("board-of-directors").join("safe-bin")
-    } else {
-        std::env::temp_dir().join(format!("bod-safe-bin-{}", std::process::id()))
-    };
-
-    // Populate the safe-dir while avoiding blocking Tokio worker threads.
-    // If running inside a Tokio runtime, use block_in_place to run the
-    // blocking population on the blocking thread pool. Otherwise run the
-    // blocking population inline.
-    // Helper that performs the blocking population work given owned inputs.
-    fn populate_inner(safe_dir: &std::path::PathBuf, sources: &Vec<(String, std::path::PathBuf)>) -> io::Result<()> {
-        // Create parent dirs and acquire a file lock to avoid races when multiple
-        // processes populate or refresh the safe-dir concurrently.
-        std::fs::create_dir_all(safe_dir)?;
-        let lock_path = safe_dir.join(".populate.lock");
-        use std::fs::OpenOptions;
-        let lock_file = OpenOptions::new().create(true).read(true).write(true).open(&lock_path)?;
-        // Block until we can acquire an exclusive lock. This prevents concurrent
-        // processes from modifying the same destination files and avoids races.
-        lock_file.lock_exclusive()?;
-
-        // Ensure we release the lock at the end of the scope.
-        let lock_guard = scopeguard::guard(lock_file, |f| {
-            let _ = f.unlock();
-        });
-
-        // For each source binary, ensure a symlink or shim exists at safe_dir/name.
-        for (name, src) in sources.iter() {
-            let dest = safe_dir.join(name);
-            // If dest exists, check if it already points to same target. If not,
-            // replace it.
-            if dest.exists() {
-                // On Unix, prefer checking symlink target. On Windows, compare file
-                // metadata when possible.
-                let need_replace = match std::fs::read_link(&dest) {
-                    Ok(target) => target != *src,
-                    Err(_) => {
-                        match (std::fs::metadata(&dest), std::fs::metadata(&src)) {
-                            (Ok(md1), Ok(md2)) => md1.len() != md2.len() || md1.permissions().readonly() != md2.permissions().readonly(),
-                            _ => true,
-                        }
-                    }
-                };
-                if !need_replace {
-                    continue;
-                }
-            }
-
-            // Create a temporary path for atomic replace.
-            let tmp_name = format!("{}.tmp.{}", name, std::process::id());
-            let tmp_dest = safe_dir.join(&tmp_name);
-
-            // Remove any leftover tmp file first (best-effort).
-            let _ = std::fs::remove_file(&tmp_dest);
-
-            // Try to create a symlink first on Unix-like platforms. Write to tmp
-            // path and then atomically rename into place to avoid races.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::symlink;
-                let res = (|| -> io::Result<()> {
-                    symlink(src, &tmp_dest)?;
-                    std::fs::rename(&tmp_dest, &dest)?;
-                    Ok(())
-                })();
-                if let Err(e) = res {
-                    eprintln!("sanitize_command_env: symlink failed for {} -> {}: {}; creating shim", src.display(), dest.display(), e);
-                    let shim = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", src.display());
-                    std::fs::write(&tmp_dest, shim.as_bytes())?;
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perms = std::fs::metadata(&tmp_dest)?.permissions();
-                    perms.set_mode(0o755);
-                    std::fs::set_permissions(&tmp_dest, perms)?;
-                    std::fs::rename(&tmp_dest, &dest)?;
-                }
-            }
-
-            #[cfg(windows)]
-            {
-                // On Windows create a .bat wrapper that forwards all args.
-                // Example content: @"C:\path\to\bin.exe" %*
-                let shim_path = tmp_dest.with_extension("bat");
-                let content = format!("@\"{}\" %*\r\n", src.display());
-                std::fs::write(&shim_path, content.as_bytes())?;
-                // Atomically move to final location name.bat
-                let final_path = dest.with_extension("bat");
-                let _ = std::fs::remove_file(&final_path);
-                std::fs::rename(&shim_path, &final_path)?;
-            }
-        }
-
-        // Unlock happens via lock_guard drop here.
-        drop(lock_guard);
-
-        Ok(())
-    }
-
-    let safe_dir_clone = safe_dir.clone();
-    let sources_clone = sources.clone();
-
-    // Run population off the current thread to avoid panics on current-thread Tokio runtimes.
-    // Use tokio::task::spawn_blocking to avoid blocking Tokio worker threads.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        let res = tokio::task::spawn_blocking(move || {
-            populate_inner(&safe_dir_clone, &sources_clone)
-        }).await.unwrap_or_else(|e| {
-            Err(io::Error::new(io::ErrorKind::Other, format!("spawn_blocking failed: {}", e)))
-        });
-        res?;
-    } else {
-        populate_inner(&safe_dir, &sources)?;
-    }
-
-    // Final check: ensure the program binary (or its shim) exists in safe_dir.
-    let mut prog_path = safe_dir.join(program_name);
-    if cfg!(windows) {
-        if !prog_path.exists() {
-            // Check PATHEXT-aware variants, including .bat created shims.
-            let pathext = std::env::var_os("PATHEXT").map(|s| s.into_string().unwrap_or_default()).unwrap_or_else(|| ".EXE;.CMD;.BAT;.COM".to_string());
-            for ext in pathext.split(';').filter_map(|s| {
-                let s = s.trim(); if s.is_empty() { None } else { Some(s) }
-            }) {
-                let candidate = safe_dir.join(format!("{}{}", program_name, ext));
-                if candidate.exists() {
-                    prog_path = candidate;
-                    break;
-                }
-            }
-            // Also check .bat shim
-            let bat = safe_dir.join(program_name).with_extension("bat");
-            if prog_path.as_path().exists() == false && bat.exists() {
-                prog_path = bat;
-            }
-        }
-    }
-    if !prog_path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("sanitize_command_env: program '{}' was not found in the constructed safe PATH; refusing to run.", program_name)
-        ));
-    }
-
-    // Warn: PATH-based sanitization reduces risk but cannot stop a child process
-    // from executing an absolute-path binary (for example, "/usr/bin/git"). Recommend
-    // OS-level sandboxing (containers, seccomp, mount namespaces) for stronger isolation.
-    eprintln!("sanitize_command_env: WARNING: PATH-based sanitization is not a full sandbox. Child processes may still exec absolute-path binaries and bypass PATH shims. Use OS-level sandboxing (containers, seccomp, namespaces) or run agents in restricted environments for stronger isolation.");
-    // Warn: PATH-based sanitization reduces risk but cannot stop a child process
-    // from executing an absolute-path binary (for example, "/usr/bin/git"). Recommend
-    // OS-level sandboxing (containers, seccomp, mount namespaces) for stronger isolation.
-    eprintln!("sanitize_command_env: WARNING: PATH-based sanitization is not a full sandbox. Child processes may still exec absolute-path binaries and bypass PATH shims. Use OS-level sandboxing (containers, seccomp, namespaces) or run agents in restricted environments for stronger isolation.");
-    // Set PATH to the single safe-dir.
-    cmd.env("PATH", safe_dir.to_str().unwrap_or_default());
-    Ok(())
-}
-
 /// Strip ANSI escape sequences and control characters from a string.
 ///
 /// Pass 1: strip ANSI escape sequences using the `strip-ansi-escapes` crate,
@@ -873,6 +866,115 @@ mod tests {
         assert!(matches!(result, AgentRunResult::Cancelled));
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert!(!output_path.exists());
+    }
+
+    #[cfg(unix)]
+    fn write_fake_git(script_path: &Path) {
+        std::fs::write(
+            script_path,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$GIT_WRAPPER_OUT"
+"#,
+        )
+        .unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(script_path, perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn run_wrapped_git(
+        fake_git_path: &Path,
+        state_dir: &Path,
+        command_line: &str,
+        output_path: &Path,
+    ) -> std::process::Output {
+        let bin_dir = state_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg(command_line);
+        command.env("GIT_WRAPPER_OUT", output_path);
+        apply_git_wrapper_with_executable(
+            &mut command,
+            &bin_dir,
+            &bin_dir.join("git"),
+            fake_git_path,
+        )
+        .unwrap();
+        command.env("PATH", &bin_dir);
+        command.output().await.unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_wrapper_blocks_only_commit_and_push_subcommands() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let fake_git_dir = temp.path().join("fake-git");
+        std::fs::create_dir_all(&fake_git_dir).unwrap();
+        let fake_git_path = fake_git_dir.join("git");
+        write_fake_git(&fake_git_path);
+
+        let allowed_output = temp.path().join("allowed.txt");
+        let allowed = run_wrapped_git(
+            &fake_git_path,
+            &state_dir,
+            "git log --grep commit",
+            &allowed_output,
+        )
+        .await;
+        assert!(allowed.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&allowed_output).unwrap(),
+            "log\n--grep\ncommit\n"
+        );
+
+        let allowed_global_flag_output = temp.path().join("allowed-global-flag.txt");
+        let allowed_global_flag = run_wrapped_git(
+            &fake_git_path,
+            &state_dir,
+            "git -C /tmp status --short",
+            &allowed_global_flag_output,
+        )
+        .await;
+        assert!(allowed_global_flag.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&allowed_global_flag_output).unwrap(),
+            "-C\n/tmp\nstatus\n--short\n"
+        );
+
+        let commit_output = temp.path().join("commit.txt");
+        let commit = run_wrapped_git(
+            &fake_git_path,
+            &state_dir,
+            "git -C /tmp commit",
+            &commit_output,
+        )
+        .await;
+        assert!(!commit.status.success());
+        assert!(
+            String::from_utf8_lossy(&commit.stderr)
+                .contains("Git commit/push blocked by Board of Directors.")
+        );
+        assert!(!commit_output.exists());
+
+        let push_output = temp.path().join("push.txt");
+        let push = run_wrapped_git(
+            &fake_git_path,
+            &state_dir,
+            "git push origin main",
+            &push_output,
+        )
+        .await;
+        assert!(!push.status.success());
+        assert!(
+            String::from_utf8_lossy(&push.stderr)
+                .contains("Git commit/push blocked by Board of Directors.")
+        );
+        assert!(!push_output.exists());
     }
 
     #[test]

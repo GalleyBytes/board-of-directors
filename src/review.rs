@@ -4,8 +4,8 @@ use crate::bugfix_session::BugfixSession;
 use crate::config::{Backend, Config};
 use crate::files;
 use crate::git;
-use std::fs::OpenOptions;
 use std::fmt;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -596,7 +596,10 @@ fn build_review_agent_request(
     let repo_root_str = repo_root.to_string_lossy().to_string();
     let full_diff_path_str = review_context.full_diff_path.to_string_lossy().to_string();
     let diff_stat_path_str = review_context.diff_stat_path.to_string_lossy().to_string();
-    let changed_files_path_str = review_context.changed_files_path.to_string_lossy().to_string();
+    let changed_files_path_str = review_context
+        .changed_files_path
+        .to_string_lossy()
+        .to_string();
 
     let prompt = format!(
         r#"You are a senior code reviewer. Review the current git branch against `origin/{default_branch}`.
@@ -713,12 +716,16 @@ mod tests {
         assert!(request.allow_repo_access);
         assert!(!request.use_sandbox);
         assert!(request.prompt.contains("git -C /repo"));
-        assert!(request
-            .prompt
-            .contains("/state/20260320120000-diff-feature.patch"));
-        assert!(request
-            .prompt
-            .contains("Do NOT edit repository files, create files in the repository"));
+        assert!(
+            request
+                .prompt
+                .contains("/state/20260320120000-diff-feature.patch")
+        );
+        assert!(
+            request
+                .prompt
+                .contains("Do NOT edit repository files, create files in the repository")
+        );
     }
 
     #[test]
@@ -759,8 +766,14 @@ mod tests {
         assert_eq!(context.default_branch, "main");
         assert_eq!(context.changed_file_count, 2);
         assert_eq!(context.diff_bytes, "diff body".len());
-        assert_eq!(std::fs::read_to_string(&context.full_diff_path).unwrap(), "diff body");
-        assert_eq!(std::fs::read_to_string(&context.diff_stat_path).unwrap(), "diff stat");
+        assert_eq!(
+            std::fs::read_to_string(&context.full_diff_path).unwrap(),
+            "diff body"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&context.diff_stat_path).unwrap(),
+            "diff stat"
+        );
         assert_eq!(
             std::fs::read_to_string(&context.changed_files_path).unwrap(),
             "src/main.rs\nsrc/review.rs\n"

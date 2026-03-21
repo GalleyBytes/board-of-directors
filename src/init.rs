@@ -122,19 +122,29 @@ fn prompt_review_model(
     let (backend, model) =
         prompt_backend_and_model(&format!("reviewer #{}", index), discovered_models)?;
     let default_cn = derive_codename(&model, used_codenames);
-    let codename = prompt_string_with_default(&format!("Codename for '{}'", model), &default_cn)?;
-    let codename = sanitize_codename(&codename)?;
-    if codename == "consolidated" || codename.starts_with("consolidated-") {
-        return Err(format!(
-            "Codename '{}' is reserved (conflicts with consolidated report filenames). Choose a different codename.",
-            codename
-        ));
+    loop {
+        let codename = prompt_string_with_default(&format!("Codename for '{}'", model), &default_cn)?;
+        let codename = sanitize_codename(&codename)?;
+        if codename == "consolidated" || codename.starts_with("consolidated-") {
+            eprintln!(
+                "  Codename '{}' is reserved (conflicts with consolidated report filenames). Choose a different codename.",
+                codename
+            );
+            continue;
+        }
+        if config::codename_is_duplicate(&codename, used_codenames) {
+            eprintln!(
+                "  Codename '{}' is already in use by another reviewer. Choose a different codename.",
+                codename
+            );
+            continue;
+        }
+        return Ok(ModelEntry {
+            codename,
+            backend,
+            model,
+        });
     }
-    Ok(ModelEntry {
-        codename,
-        backend,
-        model,
-    })
 }
 
 fn prompt_backend_and_model(
@@ -402,12 +412,18 @@ fn prompt_model_choice(label: &str, models: &[String]) -> Result<String, String>
         }
 
         let input = input.trim();
-        if let Ok(n) = input.parse::<usize>()
-            && n >= 1
-            && n <= models.len()
-        {
-            println!("  -> {}", models[n - 1]);
-            return Ok(models[n - 1].clone());
+        if let Ok(n) = input.parse::<usize>() {
+            if n >= 1 && n <= models.len() {
+                println!("  -> {}", models[n - 1]);
+                return Ok(models[n - 1].clone());
+            } else {
+                eprintln!(
+                    "  Invalid selection: {} is out of bounds (1-{}).",
+                    n,
+                    models.len()
+                );
+                continue;
+            }
         }
         if !input.is_empty() {
             println!("  -> {}", input);

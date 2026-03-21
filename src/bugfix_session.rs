@@ -512,6 +512,13 @@ impl BugfixSession {
     pub async fn mark_completed(&self, message: impl Into<String>) {
         let message = message.into();
         let mut state = self.shared.state.write().await;
+        if state.status == SessionStatus::Error || state.last_error.is_some() {
+            state.status = SessionStatus::Error;
+            state.current_step = SessionStep::Finished;
+            state.current_step_label = "Error".to_string();
+            state.will_revert_on_cancel = false;
+            return;
+        }
         state.status = SessionStatus::Completed;
         state.current_step = SessionStep::Finished;
         state.current_step_label = "Finished".to_string();
@@ -781,20 +788,18 @@ mod tests {
 
         session.activate_iteration(1, "Iteration 1").await;
         session.begin_review(2).await;
-        session
-            .note_review_agent_result("mini", true, None)
-            .await;
+        session.note_review_agent_result("mini", true, None).await;
         session
             .note_review_agent_result("haiku", false, Some("haiku failed to start agent: boom"))
             .await;
 
         let snapshot = session.snapshot().await;
         assert_eq!(snapshot.iteration_activities.len(), 2);
-        assert_eq!(snapshot.iteration_activities[0].message, "mini finished review");
         assert_eq!(
-            snapshot.iteration_activities[1].message,
-            "haiku failed"
+            snapshot.iteration_activities[0].message,
+            "mini finished review"
         );
+        assert_eq!(snapshot.iteration_activities[1].message, "haiku failed");
         assert_eq!(
             snapshot.iteration_activities[1].detail.as_deref(),
             Some("it failed to start agent: boom")
@@ -861,10 +866,38 @@ mod tests {
             snapshot.iteration_activities[0].status,
             IterationActivityStatus::Cancelled
         );
-        assert_eq!(snapshot.iteration_activities[0].message, "gpt-5-mini cancelled");
+        assert_eq!(
+            snapshot.iteration_activities[0].message,
+            "gpt-5-mini cancelled"
+        );
         assert_eq!(
             snapshot.iteration_activities[0].detail.as_deref(),
             Some("Cancelled during the fix step.")
         );
+    }
+
+    #[tokio::test]
+    async fn mark_completed_preserves_existing_error_state() {
+        let session = BugfixSession::new(
+            PathBuf::from("/tmp/state"),
+            "repo".to_string(),
+            "main".to_string(),
+            "main".to_string(),
+            vec!["mini".to_string()],
+            60,
+            SeverityLevel::High,
+            "bugfix-main.log.md".to_string(),
+        );
+
+        session.mark_error("fatal error").await;
+        session
+            .mark_completed("Iteration limit reached after 1 iteration(s).")
+            .await;
+
+        let snapshot = session.snapshot().await;
+        assert_eq!(snapshot.status, SessionStatus::Error);
+        assert_eq!(snapshot.current_step_label, "Error");
+        assert_eq!(snapshot.last_error.as_deref(), Some("fatal error"));
+        assert_eq!(snapshot.latest_message, "fatal error");
     }
 }

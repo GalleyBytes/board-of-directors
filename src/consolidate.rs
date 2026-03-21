@@ -342,17 +342,17 @@ async fn run_consolidation(
         repo_root,
         bod_dir,
     )
-        .await
-        .map_err(|e| {
-            if backend::is_arg_too_long(&e) {
-                "Prompt exceeds OS argument-size limit (E2BIG). \
+    .await
+    .map_err(|e| {
+        if backend::is_arg_too_long(&e) {
+            "Prompt exceeds OS argument-size limit (E2BIG). \
                  The diff may be too large for command-line passing. \
                  Consider reviewing a smaller changeset."
-                    .to_string()
-            } else {
-                format!("Failed to start agent for consolidation: {}", e)
-            }
-        })?;
+                .to_string()
+        } else {
+            format!("Failed to start agent for consolidation: {}", e)
+        }
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -498,8 +498,10 @@ mod tests {
         assert!(request.allow_repo_access);
         assert!(!request.use_sandbox);
         assert!(request.prompt.contains("git -C /repo"));
-        assert!(request
-            .prompt
-            .contains("Only write the requested consolidated report file."));
+        assert!(
+            request
+                .prompt
+                .contains("Only write the requested consolidated report file.")
+        );
     }
 }
