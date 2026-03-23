@@ -449,10 +449,12 @@ invent issues that are unsupported by the reviews or code.
 
 You have been given reviews from different AI agents who independently reviewed the same code changes. Your task:
 
-1. **Common Findings** (highest priority): Identify issues that multiple reviewers flagged. These are the most important since independent reviewers converged on them.
-2. **Unique Findings**: List issues that only one reviewer found, but are still worth addressing.
-3. **Outliers** (lowest priority): List observations that seem like edge cases or minor style preferences. Put these at the end.
-4. **Final Verdict**: Provide a brief overall assessment and prioritized list of what the developer should fix first.
+1. **Common Findings** (highest priority): Identify issues that multiple reviewers flagged. These are the most important since independent reviewers converged on them. If reviewers found no common issues, explicitly say so.
+2. **Unique Findings**: List issues that only one reviewer found, but are still worth addressing. If there are none, say so.
+3. **Outliers** (lowest priority): List observations that seem like edge cases or minor style preferences. Put these at the end. If there are none, omit this section.
+4. **Final Verdict**: Provide a brief overall assessment and prioritized list of what the developer should fix first. If the code is fundamentally correct and no meaningful issues were found, say that clearly.
+
+Do not manufacture findings to fill sections. An empty finding list is a valid and correct outcome. Only report issues that the reviewers actually raised and that genuinely exist in the code.
 
 Format as clean, readable markdown. Be concise and actionable.
 - Do NOT run `git commit` or `git push`.
