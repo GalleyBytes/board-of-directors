@@ -395,12 +395,23 @@ You MUST use the -RESOLVED suffix for any issue that the bugfix log confirms has
 Do NOT use bare [CRITICAL] or [HIGH] for issues that are already fixed -- that causes
 the automated fixer to re-attempt fixes that are already done, wasting time and risking regressions.
 
+CRITICAL RULE -- each severity tag must appear EXACTLY ONCE per unique issue, in the finding
+body only. Do NOT repeat severity tags in the Final Verdict or anywhere else in the report.
+The Final Verdict section must reference findings by title or description only -- no `[CRITICAL]`,
+`[HIGH]`, `[MEDIUM]`, or `[LOW]` tags. These tags are parsed by deterministic code that counts
+every occurrence; a tag repeated in a summary will be treated as a separate additional issue
+and trigger a duplicate fix attempt.
+
 Example format:
 ## Common Findings
 
 [CRITICAL] Buffer overflow in parse_input -- the slice at line 42 can panic on multi-byte UTF-8
 
 [HIGH-RESOLVED] Missing null check in user_lookup -- fixed in iteration 2 by adding guard clause
+
+## Final Verdict
+
+Fix the buffer overflow in parse_input before merging. (No severity tag here -- reference by title only.)
 "#
     } else {
         ""
