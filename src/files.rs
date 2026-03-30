@@ -6,6 +6,10 @@ pub fn ensure_state_dir(repo_root: &Path) -> Result<PathBuf, String> {
     paths::ensure_repo_state_dir(repo_root)
 }
 
+pub fn backend_log_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("backend.log")
+}
+
 /// Returns the path for the branch-scoped bugfix log.
 ///
 /// # Errors
@@ -210,6 +214,12 @@ mod tests {
         let result = bugfix_log_path(dir, "main").unwrap();
         assert_eq!(result, dir.join("bugfix-main.log.md"));
         assert!(bugfix_log_path(dir, "feature-123_test").is_ok());
+    }
+
+    #[test]
+    fn backend_log_path_lives_in_state_dir() {
+        let dir = Path::new("/tmp/state");
+        assert_eq!(backend_log_path(dir), dir.join("backend.log"));
     }
 
     #[test]

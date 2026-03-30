@@ -1,15 +1,16 @@
 use crate::paths;
+use crate::personalities::PersonalityConfig;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Backend {
     Copilot,
-    #[serde(rename = "claude-code", alias = "claude_code")]
+    #[serde(rename = "claude-code")]
     ClaudeCode,
-    #[serde(rename = "gemini-cli", alias = "gemini_cli")]
+    #[serde(rename = "gemini-cli")]
     GeminiCli,
 }
 
@@ -30,7 +31,7 @@ impl fmt::Display for Backend {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub review: ReviewConfig,
     pub consolidate: ConsolidateConfig,
@@ -38,7 +39,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewConfig {
     pub models: Vec<ModelEntry>,
 }
@@ -49,17 +50,19 @@ pub struct ModelEntry {
     pub codename: String,
     pub backend: Backend,
     pub model: String,
+    pub personality: PersonalityConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct ConsolidateConfig {
     pub backend: Backend,
     pub model: String,
+    pub personality: PersonalityConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct BugfixConfig {
     pub backend: Backend,
     pub model: String,
@@ -73,16 +76,19 @@ impl Default for ReviewConfig {
                     codename: "opus".to_string(),
                     backend: Backend::ClaudeCode,
                     model: "claude-opus-4-6".to_string(),
+                    personality: PersonalityConfig::default(),
                 },
                 ModelEntry {
                     codename: "gemini".to_string(),
                     backend: Backend::GeminiCli,
                     model: "gemini-3-pro-preview".to_string(),
+                    personality: PersonalityConfig::default(),
                 },
                 ModelEntry {
                     codename: "codex".to_string(),
                     backend: Backend::Copilot,
                     model: "gpt-4o".to_string(),
+                    personality: PersonalityConfig::default(),
                 },
             ],
         }
@@ -94,6 +100,7 @@ impl Default for ConsolidateConfig {
         Self {
             backend: Backend::ClaudeCode,
             model: "claude-sonnet-4-6".to_string(),
+            personality: PersonalityConfig::default(),
         }
     }
 }
@@ -105,34 +112,6 @@ impl Default for BugfixConfig {
             model: "gpt-4o".to_string(),
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyConfig {
-    backend: Backend,
-    review: LegacyReviewConfig,
-    consolidate: LegacyStageConfig,
-    bugfix: LegacyStageConfig,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyReviewConfig {
-    models: Vec<LegacyModelEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyModelEntry {
-    codename: String,
-    model: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyStageConfig {
-    model: String,
 }
 
 const GLOBAL_CONFIG: &str = ".bodrc.toml";
@@ -156,6 +135,14 @@ pub fn load(repo_root: &Path) -> Result<Config, String> {
 }
 
 pub fn load_path(path: &Path) -> Result<Option<Config>, String> {
+    load_path_with_notice(path, true)
+}
+
+pub fn load_path_silent(path: &Path) -> Result<Option<Config>, String> {
+    load_path_with_notice(path, false)
+}
+
+fn load_path_with_notice(path: &Path, announce: bool) -> Result<Option<Config>, String> {
     if !path.exists() {
         return Ok(None);
     }
@@ -164,36 +151,16 @@ pub fn load_path(path: &Path) -> Result<Option<Config>, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", label, e))?;
     let config = parse_config_content(&content, &label)?;
-    println!("Loaded config from {}", label);
+    if announce {
+        println!("Loaded config from {}", label);
+    }
     Ok(Some(config))
 }
 
 fn parse_config_content(content: &str, label: &str) -> Result<Config, String> {
-    match toml::from_str::<Config>(content) {
-        Ok(config) => Ok(config),
-        Err(parse_error) => {
-            if let Ok(legacy) = toml::from_str::<LegacyConfig>(content) {
-                let _ = (
-                    legacy.backend,
-                    legacy.review.models.len(),
-                    legacy.consolidate.model,
-                    legacy.bugfix.model,
-                    legacy
-                        .review
-                        .models
-                        .iter()
-                        .map(|entry| (&entry.codename, &entry.model))
-                        .collect::<Vec<_>>(),
-                );
-                Err(format!(
-                    "{} uses the old single-backend config format. Run 'bod init' to rewrite it.",
-                    label
-                ))
-            } else {
-                Err(format!("Failed to parse {}: {}", label, parse_error))
-            }
-        }
-    }
+    toml::from_str::<Config>(content).map_err(|parse_error| {
+        format!("Failed to parse {}: {}", label, parse_error)
+    })
 }
 
 pub fn write_global(config: &Config) -> Result<(), String> {
@@ -341,12 +308,36 @@ fn validate_role_model(backend: Backend, model: &str, role: &str) -> Result<(), 
     }
 }
 
+pub fn canonicalize_model_choice(
+    backend: Backend,
+    model: &str,
+    role: &str,
+) -> Result<String, String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err(format!("Invalid model for {}: model cannot be empty.", role));
+    }
+
+    match backend {
+        Backend::Copilot => Ok(trimmed.to_string()),
+        Backend::ClaudeCode => {
+            let normalized = trimmed.replace('.', "-");
+            validate_claude_model(&normalized, role)?;
+            Ok(normalized)
+        }
+        Backend::GeminiCli => {
+            validate_gemini_model(trimmed, role)?;
+            Ok(trimmed.to_string())
+        }
+    }
+}
+
 fn validate_claude_model(model: &str, role: &str) -> Result<(), String> {
     let known = claude_code_model_ids();
     if known.contains(&model) {
         return Ok(());
     }
-    if model.starts_with("claude-") {
+    if model.starts_with("claude-") && !model.contains('.') {
         eprintln!(
             "Warning: {} uses unrecognized Claude model '{}'. It may work with a newer Claude CLI, but it is not in the known list.",
             role, model
@@ -402,54 +393,6 @@ pub fn gemini_cli_model_ids() -> &'static [&'static str] {
     ]
 }
 
-fn try_normalize_claude_model(model: &str) -> Option<&'static str> {
-    match model {
-        "claude-opus-4.6" => Some("claude-opus-4-6"),
-        "claude-sonnet-4.6" => Some("claude-sonnet-4-6"),
-        "claude-sonnet-4.5" => Some("claude-sonnet-4-5"),
-        "claude-haiku-4.5" => Some("claude-haiku-4-5"),
-        _ => None,
-    }
-}
-
-pub fn normalize_models_for_backend(config: &mut Config) {
-    for entry in &mut config.review.models {
-        normalize_role_model(
-            entry.backend,
-            &mut entry.model,
-            &format!("review model '{}'", entry.codename),
-        );
-    }
-    normalize_role_model(
-        config.consolidate.backend,
-        &mut config.consolidate.model,
-        "consolidator model",
-    );
-    normalize_role_model(
-        config.bugfix.backend,
-        &mut config.bugfix.model,
-        "fixer model",
-    );
-}
-
-fn normalize_role_model(backend: Backend, model: &mut String, role: &str) {
-    if backend != Backend::ClaudeCode {
-        return;
-    }
-
-    let known = claude_code_model_ids();
-    if known.contains(&model.as_str()) {
-        return;
-    }
-    if let Some(normalized) = try_normalize_claude_model(model) {
-        eprintln!(
-            "Warning: normalizing {} '{}' -> '{}'.",
-            role, model, normalized
-        );
-        *model = normalized.to_string();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,17 +406,20 @@ mod tests {
                         codename: "a".to_string(),
                         backend: Backend::GeminiCli,
                         model: "flash".to_string(),
+                        personality: PersonalityConfig::default(),
                     },
                     ModelEntry {
                         codename: "b".to_string(),
                         backend: Backend::Copilot,
                         model: "gpt-5.3-codex".to_string(),
+                        personality: PersonalityConfig::default(),
                     },
                 ],
             },
             consolidate: ConsolidateConfig {
                 backend: Backend::ClaudeCode,
                 model: "sonnet".to_string(),
+                personality: PersonalityConfig::default(),
             },
             bugfix: BugfixConfig {
                 backend: Backend::Copilot,
@@ -485,33 +431,6 @@ mod tests {
             config.used_backends(),
             vec![Backend::Copilot, Backend::ClaudeCode, Backend::GeminiCli]
         );
-    }
-
-    #[test]
-    fn normalizes_claude_models_per_role() {
-        let mut config = Config {
-            review: ReviewConfig {
-                models: vec![ModelEntry {
-                    codename: "claude".to_string(),
-                    backend: Backend::ClaudeCode,
-                    model: "claude-opus-4.6".to_string(),
-                }],
-            },
-            consolidate: ConsolidateConfig {
-                backend: Backend::ClaudeCode,
-                model: "claude-sonnet-4.6".to_string(),
-            },
-            bugfix: BugfixConfig {
-                backend: Backend::GeminiCli,
-                model: "flash".to_string(),
-            },
-        };
-
-        normalize_models_for_backend(&mut config);
-
-        assert_eq!(config.review.models[0].model, "claude-opus-4-6");
-        assert_eq!(config.consolidate.model, "claude-sonnet-4-6");
-        assert_eq!(config.bugfix.model, "flash");
     }
 
     #[test]
@@ -537,6 +456,7 @@ mod tests {
                     codename: "gem".to_string(),
                     backend: Backend::GeminiCli,
                     model: "claude-sonnet-4-6".to_string(),
+                    personality: PersonalityConfig::default(),
                 }],
             },
             consolidate: ConsolidateConfig::default(),
@@ -556,11 +476,13 @@ mod tests {
                         codename: "alpha".to_string(),
                         backend: Backend::Copilot,
                         model: "gpt-5.3-codex".to_string(),
+                        personality: PersonalityConfig::default(),
                     },
                     ModelEntry {
                         codename: "alpha".to_string(),
                         backend: Backend::GeminiCli,
                         model: "flash".to_string(),
+                        personality: PersonalityConfig::default(),
                     },
                 ],
             },
@@ -573,25 +495,121 @@ mod tests {
     }
 
     #[test]
-    fn detects_legacy_single_backend_config() {
-        let legacy = r#"
-backend = "copilot"
-
+    fn missing_personality_fields_fail_to_parse() {
+        let content = r#"
 [review]
 models = [
-  { codename = "opus", model = "claude-opus-4.6" },
-  { codename = "gemini", model = "gemini-3-pro-preview" },
-  { codename = "codex", model = "gpt-5.3-codex" },
+  { codename = "opus", backend = "claude-code", model = "claude-opus-4-6" },
 ]
 
 [consolidate]
-model = "claude-opus-4.6"
+backend = "claude-code"
+model = "claude-sonnet-4-6"
 
 [bugfix]
-model = "gpt-5.3-codex"
+backend = "copilot"
+model = "gpt-4o"
 "#;
 
-        let error = parse_config_content(legacy, "test.toml").unwrap_err();
-        assert!(error.contains("old single-backend config format"));
+        let error = parse_config_content(content, "test.toml").unwrap_err();
+        assert!(error.contains("personality"));
+    }
+
+    #[test]
+    fn underscore_backend_names_fail_to_parse() {
+        let content = r#"
+[review]
+models = [
+  { codename = "opus", backend = "claude_code", model = "claude-opus-4-6", personality = { name = "default" } },
+]
+
+[consolidate]
+backend = "claude_code"
+model = "claude-sonnet-4-6"
+personality = { name = "default" }
+
+[bugfix]
+backend = "copilot"
+model = "gpt-4o"
+"#;
+
+        let error = parse_config_content(content, "test.toml").unwrap_err();
+        assert!(error.contains("claude_code"));
+    }
+
+    #[test]
+    fn dotted_claude_models_are_rejected_for_claude_backend() {
+        let config = Config {
+            review: ReviewConfig {
+                models: vec![ModelEntry {
+                    codename: "claude".to_string(),
+                    backend: Backend::ClaudeCode,
+                    model: "claude-opus-4.6".to_string(),
+                    personality: PersonalityConfig::default(),
+                }],
+            },
+            consolidate: ConsolidateConfig::default(),
+            bugfix: BugfixConfig::default(),
+        };
+
+        let error = validate_models_for_backend(&config).unwrap_err();
+        assert!(error.contains("Claude Code backend"));
+    }
+
+    #[test]
+    fn canonicalize_model_choice_normalizes_dotted_claude_ids() {
+        let model = canonicalize_model_choice(
+            Backend::ClaudeCode,
+            "claude-opus-4.6",
+            "reviewer 'claude'",
+        )
+        .unwrap();
+
+        assert_eq!(model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn parses_nested_personality_tables_for_reviewers_and_consolidator() {
+        let content = r#"
+[[review.models]]
+codename = "mini"
+backend = "copilot"
+model = "gpt-5.4-mini"
+
+[review.models.personality]
+name = "default"
+
+[[review.models]]
+codename = "sonnet"
+backend = "copilot"
+model = "claude-sonnet-4.6"
+
+[review.models.personality]
+name = "architectural-sanity-check"
+
+[[review.models]]
+codename = "gemini"
+backend = "gemini-cli"
+model = "auto"
+
+[review.models.personality]
+name = "devils-advocate"
+
+[consolidate]
+backend = "copilot"
+model = "gpt-5.4-mini"
+
+[consolidate.personality]
+name = "systems-guru"
+
+[bugfix]
+backend = "copilot"
+model = "gpt-5.4"
+"#;
+
+        let parsed = parse_config_content(content, "test.toml").unwrap();
+        assert_eq!(parsed.review.models.len(), 3);
+        assert_eq!(parsed.review.models[1].personality.name, "architectural-sanity-check");
+        assert_eq!(parsed.consolidate.personality.name, "systems-guru");
     }
 }

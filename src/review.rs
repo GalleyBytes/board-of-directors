@@ -4,6 +4,7 @@ use crate::bugfix_session::BugfixSession;
 use crate::config::{Backend, Config};
 use crate::files;
 use crate::git;
+use crate::personalities::{self, ResolvedPersonality};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -99,6 +100,7 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
         "Reviewing branch '{}' against '{}'...",
         branch, default_branch
     );
+    println!("  Backend log: {}", files::backend_log_path(&state_dir).display());
 
     // Reserve all output files first (before spawning any tasks) so that a
     // file-creation failure doesn't leave already-spawned tasks running as
@@ -110,12 +112,15 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
         Backend,
         String,
         String,
+        ResolvedPersonality,
     )> = Vec::new();
     for entry in &config.review.models {
         let (filename, guard) =
             agents::create_review_file(&state_dir, &entry.codename, &sanitized, &timestamp)
                 .map_err(|e| ReviewError::fatal(format!("Failed to reserve review file: {}", e)))?;
         let output_path = state_dir.join(&filename);
+        let personality = personalities::resolve(&entry.personality)
+            .map_err(ReviewError::fatal)?;
         reserved.push((
             filename,
             output_path,
@@ -123,6 +128,7 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
             entry.backend,
             entry.model.clone(),
             entry.codename.clone(),
+            personality,
         ));
     }
 
@@ -132,11 +138,10 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
         "  Review context prepared: {} changed file(s), {} bytes of diff.",
         review_context.changed_file_count, review_context.diff_bytes
     );
-
     let start_delays = reviewer_start_delays(reserved.len());
     let mut handles = Vec::new();
 
-    for ((filename, output_path, guard, agent_backend, model_id, codename), start_delay) in
+    for ((filename, output_path, guard, agent_backend, model_id, codename, personality), start_delay) in
         reserved.into_iter().zip(start_delays.into_iter())
     {
         let review_context = review_context.clone();
@@ -160,6 +165,7 @@ pub async fn run(config: &Config) -> Result<String, ReviewError> {
                 &state_dir,
                 &codename,
                 &model_id,
+                &personality,
                 &review_context,
                 &output_path,
                 guard,
@@ -249,6 +255,7 @@ pub async fn run_for_bugfix(
         "Reviewing branch '{}' against '{}'...",
         branch, default_branch
     );
+    println!("  Backend log: {}", files::backend_log_path(&state_dir).display());
     session
         .begin_review(config.review.models.len() as u32)
         .await;
@@ -260,12 +267,15 @@ pub async fn run_for_bugfix(
         Backend,
         String,
         String,
+        ResolvedPersonality,
     )> = Vec::new();
     for entry in &config.review.models {
         let (filename, guard) =
             agents::create_review_file(&state_dir, &entry.codename, &sanitized, &timestamp)
                 .map_err(|e| ReviewError::fatal(format!("Failed to reserve review file: {}", e)))?;
         let output_path = state_dir.join(&filename);
+        let personality = personalities::resolve(&entry.personality)
+            .map_err(ReviewError::fatal)?;
         reserved.push((
             filename,
             output_path,
@@ -273,6 +283,7 @@ pub async fn run_for_bugfix(
             entry.backend,
             entry.model.clone(),
             entry.codename.clone(),
+            personality,
         ));
     }
 
@@ -285,7 +296,7 @@ pub async fn run_for_bugfix(
 
     let mut join_set = tokio::task::JoinSet::new();
     let start_delays = reviewer_start_delays(reserved.len());
-    for ((filename, output_path, guard, agent_backend, model_id, codename), start_delay) in
+    for ((filename, output_path, guard, agent_backend, model_id, codename, personality), start_delay) in
         reserved.into_iter().zip(start_delays.into_iter())
     {
         let review_context = review_context.clone();
@@ -311,6 +322,7 @@ pub async fn run_for_bugfix(
                     &state_dir,
                     &codename,
                     &model_id,
+                    &personality,
                     &review_context,
                     &output_path,
                     guard,
@@ -504,11 +516,18 @@ async fn run_agent_review(
     state_dir: &Path,
     codename: &str,
     model_id: &str,
+    personality: &ResolvedPersonality,
     review_context: &ReviewContextArtifacts,
     output_path: &PathBuf,
     mut guard: agents::ReservedFile,
 ) -> Result<(), ReviewError> {
-    let request = build_review_agent_request(repo_root, state_dir, output_path, review_context);
+    let request = build_review_agent_request(
+        repo_root,
+        state_dir,
+        output_path,
+        review_context,
+        personality,
+    );
 
     let output = backend::run_agent(
         backend,
@@ -591,6 +610,7 @@ fn build_review_agent_request(
     state_dir: &Path,
     output_path: &Path,
     review_context: &ReviewContextArtifacts,
+    personality: &ResolvedPersonality,
 ) -> ReviewAgentRequest {
     let output_path_str = output_path.to_string_lossy().to_string();
     let repo_root_str = repo_root.to_string_lossy().to_string();
@@ -600,6 +620,7 @@ fn build_review_agent_request(
         .changed_files_path
         .to_string_lossy()
         .to_string();
+    let personality_block = personalities::personality_prompt_block("review", personality);
 
     let prompt = format!(
         r#"You are a senior code reviewer. Review the current git branch against `origin/{default_branch}`.
@@ -628,6 +649,7 @@ Review context files in tooling state:
 Quick context:
 - Changed files: {changed_file_count}
 - Full diff size: {diff_bytes} bytes
+{personality_block}
 
 Write your complete review to the file: {output_path_str}
 
@@ -711,6 +733,7 @@ mod tests {
             Path::new("/state"),
             Path::new("/state/review.md"),
             &review_context,
+            &personalities::resolve(&crate::personalities::PersonalityConfig::default()).unwrap(),
         );
 
         assert_eq!(request.working_dir, PathBuf::from("/state"));
@@ -727,6 +750,34 @@ mod tests {
                 .prompt
                 .contains("Do NOT edit repository files, create files in the repository")
         );
+    }
+
+    #[test]
+    fn review_agent_request_includes_personality_guidance_when_present() {
+        let review_context = ReviewContextArtifacts {
+            default_branch: "main".to_string(),
+            full_diff_path: PathBuf::from("/state/diff.patch"),
+            diff_stat_path: PathBuf::from("/state/diffstat.txt"),
+            changed_files_path: PathBuf::from("/state/files.txt"),
+            changed_file_count: 1,
+            diff_bytes: 64,
+        };
+        let personality =
+            personalities::resolve(&crate::personalities::PersonalityConfig::named(
+                "architectural-sanity-check",
+            ))
+            .unwrap();
+
+        let request = build_review_agent_request(
+            Path::new("/repo"),
+            Path::new("/state"),
+            Path::new("/state/review.md"),
+            &review_context,
+            &personality,
+        );
+
+        assert!(request.prompt.contains("Additional review personality guidance"));
+        assert!(request.prompt.contains("Question whether the change should exist"));
     }
 
     #[test]

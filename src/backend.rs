@@ -1,6 +1,7 @@
 use crate::claude_cli;
 use crate::config::Backend;
 use crate::copilot_cli;
+use crate::files;
 use crate::gemini_cli;
 use fs2::FileExt;
 use regex::Regex;
@@ -8,7 +9,8 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
@@ -24,6 +26,7 @@ const NODE_HEAP_LIMIT_MB: &str = "8192";
 const AGENT_TIMEOUT_SECS: u64 = 1800;
 const RATE_LIMIT_MAX_RETRIES: usize = 3;
 const RATE_LIMIT_FALLBACK_DELAYS_SECS: [u64; RATE_LIMIT_MAX_RETRIES] = [60, 120, 180];
+static BACKEND_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub enum AgentRunResult {
     Completed(std::process::Output),
@@ -104,9 +107,30 @@ async fn run_agent_inner_with_cancel(
     state_dir: &Path,
     mut cancel_rx: Option<&mut watch::Receiver<bool>>,
 ) -> std::io::Result<AgentRunResult> {
+    let request_id = next_backend_request_id();
     let mut retry_count = 0usize;
     loop {
-        let output = match run_agent_once_with_cancel(
+        let attempt = retry_count + 1;
+        println!(
+            "  Connecting to {} / {} (request {}, attempt {}).",
+            backend, model, request_id, attempt
+        );
+        append_backend_log(
+            state_dir,
+            &format!(
+                "request={} attempt={} event=connect backend={} model={} working_dir={} allow_repo_access={} sandbox={} prompt_bytes={}",
+                request_id,
+                attempt,
+                backend,
+                model,
+                working_dir.display(),
+                allow_repo_access,
+                use_sandbox,
+                prompt.len()
+            ),
+        );
+
+        let run_result = run_agent_once_with_cancel(
             backend,
             prompt,
             model,
@@ -117,10 +141,62 @@ async fn run_agent_inner_with_cancel(
             state_dir,
             cancel_rx.as_deref_mut(),
         )
-        .await?
-        {
-            AgentRunResult::Completed(output) => output,
-            AgentRunResult::Cancelled => return Ok(AgentRunResult::Cancelled),
+        .await;
+
+        let output = match run_result {
+            Ok(AgentRunResult::Completed(output)) => {
+                let exit = exit_status_label(&output.status);
+                println!(
+                    "  Disconnected from {} / {} (request {}, exit {}).",
+                    backend, model, request_id, exit
+                );
+                append_backend_log(
+                    state_dir,
+                    &format!(
+                        "request={} attempt={} event=completed backend={} model={} exit={} success={} stdout_bytes={} stderr_bytes={}",
+                        request_id,
+                        attempt,
+                        backend,
+                        model,
+                        exit,
+                        output.status.success(),
+                        output.stdout.len(),
+                        output.stderr.len()
+                    ),
+                );
+                if !output.status.success() {
+                    append_backend_log(
+                        state_dir,
+                        &format!(
+                            "request={} attempt={} event=output\n{}",
+                            request_id,
+                            attempt,
+                            summarize_output_for_error(&output)
+                        ),
+                    );
+                }
+                output
+            }
+            Ok(AgentRunResult::Cancelled) => {
+                append_backend_log(
+                    state_dir,
+                    &format!(
+                        "request={} attempt={} event=cancelled backend={} model={}",
+                        request_id, attempt, backend, model
+                    ),
+                );
+                return Ok(AgentRunResult::Cancelled);
+            }
+            Err(e) => {
+                append_backend_log(
+                    state_dir,
+                    &format!(
+                        "request={} attempt={} event=error backend={} model={} error={}",
+                        request_id, attempt, backend, model, e
+                    ),
+                );
+                return Err(e);
+            }
         };
 
         if !should_retry_rate_limit(&output) {
@@ -128,9 +204,10 @@ async fn run_agent_inner_with_cancel(
         }
 
         if retry_count >= RATE_LIMIT_MAX_RETRIES {
+            let details = summarize_output_for_error(&output);
             let msg = format!(
-                "Rate limit persisted after {} retries for backend '{}' and model '{}'. Giving up.",
-                RATE_LIMIT_MAX_RETRIES, backend, model
+                "Rate limit persisted after {} retries for backend '{}' and model '{}'. Giving up.\n{}",
+                RATE_LIMIT_MAX_RETRIES, backend, model, details
             );
             eprintln!("{}", msg);
             // Intentional immediate error return: propagating rate-limit exhaustion
@@ -157,6 +234,17 @@ async fn run_agent_inner_with_cancel(
             Duration::from_secs(fallback_secs)
         };
         retry_count += 1;
+        append_backend_log(
+            state_dir,
+            &format!(
+                "request={} attempt={} event=rate_limit backend={} model={} retry_in_secs={}",
+                request_id,
+                attempt,
+                backend,
+                model,
+                wait.as_secs()
+            ),
+        );
         eprintln!(
             "Rate limit detected from backend '{}' with model '{}'. Waiting {}s before retry {}/{}.",
             backend,
@@ -552,12 +640,42 @@ fn rate_limit_text(output: &std::process::Output) -> String {
 }
 
 fn is_rate_limited_text(text: &str) -> bool {
-    // Use regex-driven detection with word boundaries and common JSON/header forms
-    static RATE_RE: OnceLock<Regex> = OnceLock::new();
-    let re = RATE_RE.get_or_init(|| {
-        Regex::new(r##"(?i)(?:(?:^|[^0-9.])429(?:$|[^0-9.])|http\s*/?\s*429|status\s*:\s*429|error\s*:\s*"?429(?:$|[^0-9.])|retry-after\s*:|\bretry_after\b|\btoo many requests\b|\brate limit\b|\brate-limit\b|\brate_limited\b|\bresource exhausted\b|\bresource_exhausted\b|\bquota exceeded\b)"##).unwrap()
+    static EXPLICIT_RE: OnceLock<Regex> = OnceLock::new();
+    static RESOURCE_EXHAUSTION_RE: OnceLock<Regex> = OnceLock::new();
+    static RATE_LIMIT_EXPLICIT_RE: OnceLock<Regex> = OnceLock::new();
+    static RATE_PHRASE_RE: OnceLock<Regex> = OnceLock::new();
+
+    let explicit_re = EXPLICIT_RE.get_or_init(|| {
+        Regex::new(
+            r##"(?i)(?:(?:^|[^0-9.])429(?:$|[^0-9.])|http\s*/?\s*429|status\s*:\s*429|error\s*:\s*"?429(?:$|[^0-9.])|retry-after\s*:|\bretry_after\b|\btoo many requests\b|\bquota exceeded\b)"##,
+        )
+        .unwrap()
     });
-    re.is_match(text)
+    if explicit_re.is_match(text) {
+        return true;
+    }
+
+    let resource_exhaustion_re = RESOURCE_EXHAUSTION_RE.get_or_init(|| {
+        Regex::new(r"(?i)\bresource(?:\s+has\s+been)?\s+exhausted\b").unwrap()
+    });
+    if resource_exhaustion_re.is_match(text) {
+        return true;
+    }
+
+    let rate_limit_explicit_re = RATE_LIMIT_EXPLICIT_RE.get_or_init(|| {
+        Regex::new(
+            r"(?im)^\s*(?:(?:error|status)\s*:\s*)?(?:rate_limited|rate[-_ ]?limit(?:ed|[ _-](?:exceeded|hit|reached)))(?:\s*\([^)]*\))*\s*[.!?]*\s*$",
+        )
+        .unwrap()
+    });
+    if rate_limit_explicit_re.is_match(text) {
+        return true;
+    }
+
+    let rate_phrase_re = RATE_PHRASE_RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:rate limit(?:ed)?|rate-limit(?:ed)?|rate_limited|resource exhausted|resource_exhausted)\b").unwrap()
+    });
+    rate_phrase_re.is_match(text)
 }
 
 fn retry_delay_from_output(output: &std::process::Output) -> Option<Duration> {
@@ -614,6 +732,74 @@ fn duration_from_capture(value: &str, unit: &str) -> Option<Duration> {
     };
     let seconds = seconds.ceil().max(1.0) as u64;
     Some(Duration::from_secs(seconds))
+}
+
+fn summarize_output_for_error(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = summarize_text(&stdout);
+    let stderr = summarize_text(&stderr);
+    format!("Last agent output:\nSTDOUT:\n{}\nSTDERR:\n{}", stdout, stderr)
+}
+
+fn summarize_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+    let lines = trimmed.lines().take(20).collect::<Vec<_>>().join("\n");
+    if trimmed.lines().count() > 20 {
+        format!("{}\n...<truncated>", lines)
+    } else {
+        lines
+    }
+}
+
+fn next_backend_request_id() -> u64 {
+    BACKEND_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn exit_status_label(status: &std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string())
+}
+
+fn append_backend_log(state_dir: &Path, message: &str) {
+    static LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = match LOG_LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            eprintln!("Warning: backend log mutex was poisoned.");
+            return;
+        }
+    };
+
+    let log_path = files::backend_log_path(state_dir);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| format!("{}.{}", duration.as_secs(), duration.subsec_millis()))
+        .unwrap_or_else(|_| "0.000".to_string());
+    let line = format!("[{}] {}\n", timestamp, message);
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        file.write_all(line.as_bytes())?;
+        file.flush()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        eprintln!(
+            "Warning: failed to append backend log {}: {}",
+            log_path.display(),
+            e
+        );
+    }
 }
 
 fn spawn_command(
@@ -841,6 +1027,8 @@ pub fn is_arg_too_long(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
+    use std::os::unix::process::ExitStatusExt;
 
     #[cfg(not(windows))]
     #[tokio::test]
@@ -980,7 +1168,14 @@ printf '%s\n' "$@" > "$GIT_WRAPPER_OUT"
     #[test]
     fn detects_rate_limit_text() {
         assert!(is_rate_limited_text("HTTP 429: Too Many Requests"));
+        assert!(is_rate_limited_text("Rate limit exceeded"));
+        assert!(is_rate_limited_text("Error: rate_limited"));
         assert!(is_rate_limited_text("resource_exhausted, try again later"));
+        assert!(is_rate_limited_text("Resource has been exhausted (check quota)."));
+        assert!(is_rate_limited_text("Rate limit hit. Retry after 90 seconds."));
+        // Terse backend errors without retry hints must still be detected
+        assert!(is_rate_limited_text("resource_exhausted"));
+        assert!(is_rate_limited_text("rate_limited"));
         assert!(!is_rate_limited_text("syntax error"));
         // Ensure "429" embedded in other tokens does not spuriously match
         assert!(!is_rate_limited_text("version 1.429.0"));
@@ -1010,6 +1205,19 @@ printf '%s\n' "$@" > "$GIT_WRAPPER_OUT"
     fn parses_retry_after_header() {
         let hdr = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 10\r\n";
         assert_eq!(extract_retry_delay(hdr).map(|d| d.as_secs()), Some(10));
+    }
+
+    #[test]
+    fn summarizes_output_for_error_limits_length() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: b"one\ntwo\nthree".to_vec(),
+            stderr: b"boom".to_vec(),
+        };
+
+        let summary = summarize_output_for_error(&output);
+        assert!(summary.contains("STDOUT:\none\ntwo\nthree"));
+        assert!(summary.contains("STDERR:\nboom"));
     }
 
     #[test]

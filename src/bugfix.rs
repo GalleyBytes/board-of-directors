@@ -6,11 +6,13 @@ use crate::config::{Backend, Config};
 use crate::consolidate;
 use crate::files;
 use crate::git;
+use crate::personalities;
 use crate::review;
 use crate::rollback;
 use crate::web;
 use regex::Regex;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -165,6 +167,7 @@ pub async fn run(
         severity.included_levels().join(", ")
     );
     println!("Dashboard: {} (port {})", server.url, server.port);
+    print_backend_request_footprint(config);
     if no_open {
         println!(
             "Automatic browser launch is disabled. Open the URL manually if you want the dashboard."
@@ -347,6 +350,7 @@ pub async fn run(
             .iter()
             .map(|model| model.codename.clone())
             .collect();
+        let consolidate_personality = personalities::resolve(&config.consolidate.personality)?;
 
         let report = match run_cancellable(
             &session,
@@ -354,6 +358,7 @@ pub async fn run(
                 &config.consolidate.backend,
                 &state_dir,
                 &config.consolidate.model,
+                &consolidate_personality,
                 Some(&review_timestamp),
                 &codenames,
                 &repo_root,
@@ -596,11 +601,21 @@ fn render_dry_run_summary(
     delay_start: bool,
     no_open: bool,
 ) -> String {
+    let backend_log_path = files::backend_log_path(state_dir);
+    let backend_request_footprint = render_backend_request_footprint(config);
     let reviewers = config
         .review
         .models
         .iter()
-        .map(|entry| format!("- {}: {} / {}", entry.codename, entry.backend, entry.model))
+        .map(|entry| {
+            format!(
+                "- {}: {} / {} / personality: {}",
+                entry.codename,
+                entry.backend,
+                entry.model,
+                personalities::display_selection(&entry.personality)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let iteration_limit = max_iterations
@@ -617,6 +632,7 @@ fn render_dry_run_summary(
 
 Repository root: {}
 State dir: {}
+Backend log: {}
 Branch: {}
 Sanitized branch: {}
 Bugfix log path: {}
@@ -626,9 +642,11 @@ Severity threshold: {}
 Manual start: {}
 Browser auto-open: {}
 Review artifact cleanup limit: {}
+Backend request footprint:
+{}
 Reviewers:
 {}
-Consolidator: {} / {}
+Consolidator: {} / {} / personality: {}
 Fixer: {} / {}
 Fixer execution:
 - working directory: {}
@@ -638,6 +656,7 @@ Fixer execution:
 {}"#,
         repo_root.display(),
         state_dir.display(),
+        backend_log_path.display(),
         branch,
         sanitized_branch,
         log_path.display(),
@@ -647,9 +666,11 @@ Fixer execution:
         if delay_start { "enabled" } else { "disabled" },
         if no_open { "disabled" } else { "enabled" },
         REVIEW_FILE_RETENTION,
+        backend_request_footprint,
         reviewers,
         config.consolidate.backend,
         config.consolidate.model,
+        personalities::display_selection(&config.consolidate.personality),
         config.bugfix.backend,
         config.bugfix.model,
         state_dir.display(),
@@ -657,6 +678,34 @@ Fixer execution:
         log_path.display(),
         prompt_note
     )
+}
+
+fn print_backend_request_footprint(config: &Config) {
+    println!("Backend request footprint:");
+    for line in render_backend_request_footprint(config).lines() {
+        println!("{}", line);
+    }
+}
+
+fn render_backend_request_footprint(config: &Config) -> String {
+    let mut counts = BTreeMap::<Backend, usize>::new();
+    for reviewer in &config.review.models {
+        *counts.entry(reviewer.backend).or_default() += 1;
+    }
+    *counts.entry(config.consolidate.backend).or_default() += 1;
+    *counts.entry(config.bugfix.backend).or_default() += 1;
+
+    counts
+        .into_iter()
+        .map(|(backend, count)| {
+            if count == 1 {
+                format!("- {}: 1 role", backend)
+            } else {
+                format!("- {}: {} roles", backend, count)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn count_severities(report: &str, included: &[&str]) -> Vec<(String, u32)> {
@@ -719,11 +768,17 @@ mod tests {
                     codename: "reviewer-one".to_string(),
                     backend: Backend::Copilot,
                     model: "gpt-5-mini".to_string(),
+                    personality: crate::personalities::PersonalityConfig::named(
+                        "architectural-sanity-check",
+                    ),
                 }],
             },
             consolidate: crate::config::ConsolidateConfig {
                 backend: Backend::ClaudeCode,
                 model: "sonnet".to_string(),
+                personality: crate::personalities::PersonalityConfig::named(
+                    "blast-radius-context",
+                ),
             },
             bugfix: crate::config::BugfixConfig {
                 backend: Backend::GeminiCli,
@@ -749,10 +804,52 @@ mod tests {
         assert!(summary.contains("Bugfix dry run only. No agents"));
         assert!(summary.contains("Browser auto-open: disabled"));
         assert!(summary.contains("working directory: /state"));
+        assert!(summary.contains("Backend log: /state/backend.log"));
+        assert!(summary.contains("Backend request footprint:"));
+        assert!(summary.contains("- copilot: 1 role"));
+        assert!(summary.contains("- claude-code: 1 role"));
+        assert!(summary.contains("- gemini-cli: 1 role"));
         assert!(
             summary.contains("bugfix log appends must go directly to /state/bugfix-feature.log.md")
         );
         assert!(summary.contains("dry-run mode does not append notes to the bugfix log"));
+        assert!(summary.contains("personality: Architectural Sanity Check"));
+        assert!(summary.contains("Consolidator: claude-code / sonnet / personality: Blast Radius & Context"));
+    }
+
+    #[test]
+    fn backend_request_footprint_groups_same_backend_roles() {
+        let config = Config {
+            review: crate::config::ReviewConfig {
+                models: vec![
+                    crate::config::ModelEntry {
+                        codename: "reviewer-one".to_string(),
+                        backend: Backend::Copilot,
+                        model: "gpt-5-mini".to_string(),
+                        personality: crate::personalities::PersonalityConfig::named("default"),
+                    },
+                    crate::config::ModelEntry {
+                        codename: "reviewer-two".to_string(),
+                        backend: Backend::Copilot,
+                        model: "gpt-5".to_string(),
+                        personality: crate::personalities::PersonalityConfig::named("default"),
+                    },
+                ],
+            },
+            consolidate: crate::config::ConsolidateConfig {
+                backend: Backend::Copilot,
+                model: "gpt-5".to_string(),
+                personality: crate::personalities::PersonalityConfig::named("default"),
+            },
+            bugfix: crate::config::BugfixConfig {
+                backend: Backend::GeminiCli,
+                model: "flash".to_string(),
+            },
+        };
+
+        let footprint = render_backend_request_footprint(&config);
+        assert!(footprint.contains("- copilot: 3 roles"));
+        assert!(footprint.contains("- gemini-cli: 1 role"));
     }
 
     #[test]

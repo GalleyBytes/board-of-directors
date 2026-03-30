@@ -13,6 +13,7 @@ mod gemini_cli;
 mod git;
 mod init;
 mod paths;
+mod personalities;
 mod review;
 mod rollback;
 mod web;
@@ -69,7 +70,7 @@ enum Commands {
     },
     /// Print version information
     Version,
-    /// Configure models interactively
+    /// Configure reviewers, consolidator, and fixer interactively
     Init {
         /// Write to global config (~/.config/board-of-directors/.bodrc.toml)
         #[arg(short, long)]
@@ -150,15 +151,18 @@ async fn main() {
         return;
     }
 
-    let mut config = match config::load(&repo_root) {
+    let config = match config::load(&repo_root) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     };
-    config::normalize_models_for_backend(&mut config);
     if let Err(e) = config::validate_models_for_backend(&config) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+    if let Err(e) = personalities::validate_configured_personalities(&config) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -378,11 +382,13 @@ mod tests {
                     codename: "r1".to_string(),
                     backend: config::Backend::Copilot,
                     model: "gpt-5.3-codex".to_string(),
+                    personality: crate::personalities::PersonalityConfig::default(),
                 }],
             },
             consolidate: config::ConsolidateConfig {
                 backend: config::Backend::GeminiCli,
                 model: "flash".to_string(),
+                personality: crate::personalities::PersonalityConfig::default(),
             },
             bugfix: config::BugfixConfig {
                 backend: config::Backend::ClaudeCode,
@@ -404,6 +410,7 @@ mod tests {
             consolidate: config::ConsolidateConfig {
                 backend: config::Backend::GeminiCli,
                 model: "flash".to_string(),
+                personality: crate::personalities::PersonalityConfig::default(),
             },
             bugfix: config::BugfixConfig {
                 backend: config::Backend::ClaudeCode,

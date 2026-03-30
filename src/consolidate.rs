@@ -4,6 +4,7 @@ use crate::bugfix_log;
 use crate::config::{Backend, Config};
 use crate::files;
 use crate::git;
+use crate::personalities::{self, ResolvedPersonality};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -89,6 +90,7 @@ pub async fn run(config: &Config) -> Result<(), String> {
     }
 
     println!("\nConsolidating {} review file(s)...", selected_files.len());
+    let personality = personalities::resolve(&config.consolidate.personality)?;
 
     write_selected_reviews(
         &config.consolidate.backend,
@@ -96,6 +98,7 @@ pub async fn run(config: &Config) -> Result<(), String> {
         &state_dir,
         &selected_files,
         &config.consolidate.model,
+        &personality,
         &sanitized,
     )
     .await
@@ -141,6 +144,7 @@ pub async fn run_latest(config: &Config) -> Result<(), String> {
         branch,
         selected_files.len()
     );
+    let personality = personalities::resolve(&config.consolidate.personality)?;
 
     write_selected_reviews(
         &config.consolidate.backend,
@@ -148,6 +152,7 @@ pub async fn run_latest(config: &Config) -> Result<(), String> {
         &state_dir,
         &selected_files,
         &config.consolidate.model,
+        &personality,
         &sanitized,
     )
     .await
@@ -159,6 +164,7 @@ async fn write_selected_reviews(
     state_dir: &Path,
     selected_files: &[String],
     model: &str,
+    personality: &ResolvedPersonality,
     sanitized_branch: &str,
 ) -> Result<(), String> {
     let timestamp = agents::timestamp_now();
@@ -177,6 +183,7 @@ async fn write_selected_reviews(
         "",
         "",
         model,
+        personality,
     )
     .await?;
 
@@ -219,6 +226,7 @@ pub async fn run_auto(
     backend: &Backend,
     bod_dir: &Path,
     consolidate_model: &str,
+    personality: &ResolvedPersonality,
     review_timestamp: Option<&str>,
     codenames: &[String],
     repo_root: &Path,
@@ -258,6 +266,7 @@ pub async fn run_auto(
         &bugfix_log.history,
         &bugfix_log.notes,
         consolidate_model,
+        personality,
     )
     .await?;
 
@@ -309,6 +318,7 @@ async fn run_consolidation(
     bugfix_log: &str,
     user_notes: &str,
     model: &str,
+    personality: &ResolvedPersonality,
 ) -> Result<String, String> {
     let mut reviews_content = String::new();
     for filename in files {
@@ -330,6 +340,7 @@ async fn run_consolidation(
         bugfix_log,
         user_notes,
         &reviews_content,
+        personality,
     );
 
     let output = backend::run_agent(
@@ -371,9 +382,11 @@ fn build_consolidation_agent_request(
     bugfix_log: &str,
     user_notes: &str,
     reviews_content: &str,
+    personality: &ResolvedPersonality,
 ) -> ConsolidationAgentRequest {
     let out_path_str = out_path.to_string_lossy().to_string();
     let repo_root_str = repo_root.to_string_lossy().to_string();
+    let personality_block = personalities::personality_prompt_block("consolidation", personality);
 
     let severity_instruction = if severity_tags {
         r#"
@@ -475,7 +488,7 @@ Format as clean, readable markdown. Be concise and actionable.
 - Use the supplied review files and bugfix log only as tooling inputs for synthesis.
 - Do not treat their filenames, paths, or mere presence as repository defects.
 - Only write the requested consolidated report file.
-  {severity_instruction}{bugfix_log_section}{user_notes_section}
+  {severity_instruction}{bugfix_log_section}{user_notes_section}{personality_block}
 Write the complete consolidated report to: {out_path_str}
 
 Here are the individual reviews:
@@ -505,6 +518,7 @@ mod tests {
             "",
             "",
             "--- Review from a ---\n[HIGH] issue",
+            &personalities::resolve(&crate::personalities::PersonalityConfig::default()).unwrap(),
         );
 
         assert_eq!(request.working_dir, PathBuf::from("/state"));
@@ -516,5 +530,27 @@ mod tests {
                 .prompt
                 .contains("Only write the requested consolidated report file.")
         );
+    }
+
+    #[test]
+    fn consolidation_request_includes_personality_guidance_when_present() {
+        let personality =
+            personalities::resolve(&crate::personalities::PersonalityConfig::named(
+                "blast-radius-context",
+            ))
+            .unwrap();
+        let request = build_consolidation_agent_request(
+            Path::new("/repo"),
+            Path::new("/state"),
+            Path::new("/state/consolidated.md"),
+            false,
+            "",
+            "",
+            "--- Review from a ---\n[HIGH] issue",
+            &personality,
+        );
+
+        assert!(request.prompt.contains("Additional consolidation personality guidance"));
+        assert!(request.prompt.contains("Map the external systems"));
     }
 }

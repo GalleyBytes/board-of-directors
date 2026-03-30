@@ -25,11 +25,16 @@ bod init
 
 `bod init` asks you to choose:
 
-- 3 reviewers
-- 1 consolidator
-- 1 fixer
+- how many reviewers to run (default: 3)
+- backend, model, codename, and personality for each reviewer
+- backend, model, and personality for the consolidator
+- backend and model for the fixer
 
 Each role can use a different backend and model.
+
+Built-in personalities include `default`, `architectural-sanity-check`, `blast-radius-context`, `devils-advocate`, `systems-guru`, `legacy-archaeologist`, `curious-junior`, and `helpful-owner`.
+
+You can also paste your own personality instructions during `bod init`. If you want to reuse them later, save them into the global personality library at `~/.config/board-of-directors/personalities/<name>.md`.
 
 ## The main workflow: `bod bugfix`
 
@@ -84,6 +89,7 @@ Most people should start with `bugfix`, but these are available when you want mo
 - `--global` writes config to `~/.config/board-of-directors/.bodrc.toml`
 - without `--global`, config is repo-scoped
 - `--reconfigure` skips the overwrite confirmation prompt
+- global reusable custom personalities live under `~/.config/board-of-directors/personalities/`
 
 ## Where files go
 
